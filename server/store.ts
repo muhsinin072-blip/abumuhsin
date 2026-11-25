@@ -815,6 +815,63 @@ function normalizeDb(parsed: CbtDatabase): CbtDatabase {
       (parsed as unknown as Record<CollectionName, unknown[]>)[name] = [];
     }
   }
+  parsed.teachers = parsed.teachers
+    .filter((t): t is TeacherAccount => Boolean(t && typeof t === 'object'))
+    .map((t) => ({
+      ...t,
+      nip: String(t.nip ?? ''),
+      fullName: String(t.fullName ?? ''),
+      subject: String(t.subject ?? ''),
+      isActive: t.isActive !== false,
+    }));
+  parsed.students = parsed.students
+    .filter((s): s is Student => Boolean(s && typeof s === 'object'))
+    .map((s) => ({
+      ...s,
+      nis: String(s.nis ?? ''),
+      name: String(s.name ?? ''),
+      className: String(s.className ?? ''),
+      room: String(s.room ?? ''),
+      sessionGroup: String(s.sessionGroup ?? ''),
+      password: String(s.password ?? ''),
+    }));
+  parsed.banks = parsed.banks
+    .filter((b): b is QuestionBank => Boolean(b && typeof b === 'object'))
+    .map((b) => ({
+      ...b,
+      code: String(b.code ?? ''),
+      subject: String(b.subject ?? ''),
+      gradeLevel: String(b.gradeLevel ?? ''),
+      teacherName: typeof b.teacherName === 'string' ? b.teacherName : '',
+      kkm: Number.isFinite(Number(b.kkm)) ? Number(b.kkm) : 75,
+      pgWeightPercent: Number.isFinite(Number(b.pgWeightPercent)) ? Number(b.pgWeightPercent) : 100,
+      essayWeightPercent: Number.isFinite(Number(b.essayWeightPercent)) ? Number(b.essayWeightPercent) : 0,
+      questions: Array.isArray(b.questions) ? b.questions : [],
+    }));
+  parsed.exams = parsed.exams
+    .filter((e): e is ExamSchedule => Boolean(e && typeof e === 'object'))
+    .map((e) => ({
+      ...e,
+      title: String(e.title ?? ''),
+      subject: String(e.subject ?? ''),
+      token: String(e.token ?? ''),
+      targetClasses: Array.isArray(e.targetClasses) ? e.targetClasses : [],
+    }));
+  parsed.sessions = parsed.sessions
+    .filter((s): s is ExamSession => Boolean(s && typeof s === 'object'))
+    .map((s) => ({
+      ...s,
+      questionOrder: Array.isArray(s.questionOrder) ? s.questionOrder : [],
+      optionOrders: s.optionOrders && typeof s.optionOrders === 'object' ? s.optionOrders : {},
+      answers: s.answers && typeof s.answers === 'object' ? s.answers : {},
+    }));
+  parsed.materials = parsed.materials
+    .filter((m): m is LearningMaterial => Boolean(m && typeof m === 'object'))
+    .map((m) => ({
+      ...m,
+      targetClasses: Array.isArray(m.targetClasses) ? m.targetClasses : [],
+      teacherName: typeof m.teacherName === 'string' ? m.teacherName : '',
+    }));
   for (const bank of parsed.banks) {
     if (!bank.teacherId && bank.teacherName) {
       const matched = parsed.teachers.find(
@@ -1013,6 +1070,9 @@ class StoreManager {
 
   async load(): Promise<StoreContext> {
     if (USE_IN_PROCESS_CACHE) {
+      if (this.pendingFlushes > 0) {
+        await this.flushChain;
+      }
       const now = Date.now();
       const needsCheck =
         !this.cache ||
@@ -1115,7 +1175,8 @@ class StoreManager {
       nextVersion = await dbFlushChanges(upserts, deletes, events);
     } catch (err) {
       ctx.events.unshift(...events);
-      if (cacheTarget && this.cache === cacheTarget) {
+      ctx.dirty = false;
+      if ((cacheTarget && this.cache === cacheTarget) || this.cache?.db === ctx.db) {
         this.cache = null;
       }
       throw err;
@@ -1181,6 +1242,17 @@ class StoreManager {
     const ctx = contextStorage.getStore();
     if (ctx) {
       ctx.dirty = true;
+    }
+  }
+
+  discard(): void {
+    const ctx = contextStorage.getStore();
+    if (ctx) {
+      if (ctx.dirty && this.cache?.db === ctx.db) {
+        this.cache = null;
+      }
+      ctx.dirty = false;
+      ctx.events.length = 0;
     }
   }
 

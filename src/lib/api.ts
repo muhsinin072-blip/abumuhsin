@@ -176,9 +176,12 @@ export async function apiFetch<T>(url: string, options: RequestInit = {}): Promi
                   await delayMs(150);
                   continue;
                 }
-                if (check === 'invalid') {
-                  handleUnauthorizedResponse(url, errMsg);
+                if (check === 'error') {
+                  throw new Error(
+                    'Koneksi server atau database terganggu sementara. Silakan muat ulang atau coba lagi.'
+                  );
                 }
+                handleUnauthorizedResponse(url, errMsg);
                 throw new Error(errMsg);
               }
               handleUnauthorizedResponse(url, errMsg);
@@ -215,9 +218,12 @@ export async function apiFetch<T>(url: string, options: RequestInit = {}): Promi
                 await delayMs(150);
                 continue;
               }
-              if (check === 'invalid') {
-                handleUnauthorizedResponse(url, sessionMsg);
+              if (check === 'error') {
+                throw new Error(
+                  'Koneksi server atau database terganggu sementara. Silakan muat ulang atau coba lagi.'
+                );
               }
+              handleUnauthorizedResponse(url, sessionMsg);
             } else {
               handleUnauthorizedResponse(url, sessionMsg);
             }

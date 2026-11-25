@@ -61,8 +61,8 @@ function resolvePostgresConfig(): pg.PoolConfig | null {
   );
 
   const isServerless = process.env.VERCEL === '1';
-  const defaultPoolMax = isServerless ? 12 : 25;
-  const poolMax = Math.max(5, Math.min(50, Number(process.env.PG_POOL_MAX) || defaultPoolMax));
+  const defaultPoolMax = isServerless ? 5 : 20;
+  const poolMax = Math.max(2, Math.min(50, Number(process.env.PG_POOL_MAX) || defaultPoolMax));
 
   if (rawUrl) {
     let cleanedUrl = rawUrl;
@@ -93,9 +93,9 @@ function resolvePostgresConfig(): pg.PoolConfig | null {
     return {
       connectionString: cleanedUrl,
       max: poolMax,
-      connectionTimeoutMillis: 8_000,
-      idleTimeoutMillis: 20_000,
-      query_timeout: 10_000,
+      connectionTimeoutMillis: 12_000,
+      idleTimeoutMillis: isServerless ? 10_000 : 20_000,
+      query_timeout: 15_000,
       keepAlive: true,
       allowExitOnIdle: isServerless,
       ...(useSsl
@@ -127,9 +127,9 @@ function resolvePostgresConfig(): pg.PoolConfig | null {
       user,
       password,
       max: poolMax,
-      connectionTimeoutMillis: 8_000,
-      idleTimeoutMillis: 20_000,
-      query_timeout: 10_000,
+      connectionTimeoutMillis: 12_000,
+      idleTimeoutMillis: isServerless ? 10_000 : 20_000,
+      query_timeout: 15_000,
       keepAlive: true,
       allowExitOnIdle: isServerless,
       ...(useSsl
@@ -238,10 +238,24 @@ function isTransientPgError(err: unknown): boolean {
     return true;
   }
   const msg = message.toLowerCase();
+  if (
+    msg.includes('tenant or user not found') ||
+    msg.includes('password authentication failed') ||
+    msg.includes('no pg_hba.conf entry')
+  ) {
+    return false;
+  }
   return (
     msg.includes('connection terminated') ||
     msg.includes('connection ended') ||
     msg.includes('terminating connection') ||
+    msg.includes('db_termination') ||
+    msg.includes('client_termination') ||
+    msg.includes('max clients reached') ||
+    msg.includes('maxclientsinsessionmode') ||
+    msg.includes('connection pool') ||
+    msg.includes('ssl connection has been closed') ||
+    msg.includes('server closed the connection unexpectedly') ||
     msg.includes('timeout exceeded') ||
     msg.includes('connection timeout') ||
     msg.includes('query read timeout') ||
@@ -258,6 +272,19 @@ function isTransientPgError(err: unknown): boolean {
     msg.includes('database system is starting up') ||
     msg.includes('cannot use a pool after calling end')
   );
+}
+
+function sanitizeJsonForPg(value: unknown): string {
+  // PostgreSQL jsonb rejects \u0000 null characters (SQLSTATE 22P05).
+  return JSON.stringify(value).replace(/\\u0000/g, '');
+}
+
+function createVercelMissingDbError(): Error & { code: string } {
+  const err = new Error(
+    'DATABASE_URL belum dikonfigurasi pada Environment Variables Vercel. Tambahkan DATABASE_URL PostgreSQL lalu Redeploy.'
+  ) as Error & { code: string };
+  err.code = 'MISSING_DATABASE_URL';
+  return err;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -337,12 +364,18 @@ function ensurePgSchema(): Promise<void> {
 
       const client = await pgPool!.connect();
       try {
-        await client.query('SELECT pg_advisory_lock(84291042)');
         for (const statement of PG_SCHEMA_STATEMENTS) {
-          await client.query(statement);
+          try {
+            await client.query(statement);
+          } catch (stmtErr) {
+            const code = extractErrorDetails(stmtErr).code;
+            // Ignore benign concurrent CREATE TABLE IF NOT EXISTS races across serverless instances.
+            if (code !== '42710' && code !== '23505') {
+              throw stmtErr;
+            }
+          }
         }
       } finally {
-        await client.query('SELECT pg_advisory_unlock(84291042)').catch(() => undefined);
         client.release();
       }
     }).catch((err) => {
@@ -368,12 +401,21 @@ export function classifyDbError(err: unknown): DbErrorClassification {
   );
   const lower = rawMessage.toLowerCase();
 
+  if (pgCode === 'MISSING_DATABASE_URL') {
+    return {
+      code: 'DB_CONFIG_ERROR',
+      retryable: false,
+      userMessage: rawMessage,
+      logSummary: rawMessage,
+    };
+  }
+
   if (pgCode === '53000' || lower.includes('exceeded the quota') || lower.includes('compute time quota')) {
     return {
       code: 'DB_QUOTA_EXCEEDED',
       retryable: false,
       userMessage:
-        'Kuota database PostgreSQL (Neon) pada DATABASE_URL sudah habis/terlampaui. Perbarui DATABASE_URL di Secrets dengan project Neon atau PostgreSQL baru, lalu restart server.',
+        'Kuota database PostgreSQL pada DATABASE_URL sudah habis/terlampaui. Perbarui DATABASE_URL di Secrets dengan project PostgreSQL baru, lalu restart server.',
       logSummary: `PostgreSQL quota exceeded (${pgCode || '53000'}): ${rawMessage}`,
     };
   }
@@ -384,15 +426,25 @@ export function classifyDbError(err: unknown): DbErrorClassification {
     pgCode === '3D000' ||
     pgCode === 'ERR_INVALID_URL' ||
     lower.includes('password authentication failed') ||
+    lower.includes('tenant or user not found') ||
     lower.includes('no pg_hba.conf entry') ||
-    lower.includes('does not exist')
+    (lower.includes('database') && lower.includes('does not exist'))
   ) {
     return {
       code: 'DB_CONFIG_ERROR',
       retryable: false,
       userMessage:
-        'Konfigurasi DATABASE_URL PostgreSQL tidak valid atau autentikasi ditolak. Periksa kembali DATABASE_URL di Secrets.',
+        'Konfigurasi DATABASE_URL PostgreSQL tidak valid atau autentikasi ditolak. Periksa kembali DATABASE_URL di Secrets / Environment Variables.',
       logSummary: `PostgreSQL config/auth error (${pgCode || 'auth'}): ${rawMessage}`,
+    };
+  }
+
+  if (pgCode && /^(22|23|42)/.test(pgCode)) {
+    return {
+      code: `PG_${pgCode}`,
+      retryable: false,
+      userMessage: `Terjadi kesalahan data/skema database (${pgCode}). Silakan periksa input lalu coba kembali.`,
+      logSummary: `PostgreSQL data/schema error (${pgCode}): ${rawMessage}`,
     };
   }
 
@@ -413,7 +465,7 @@ function shouldFailoverPgError(err: unknown): boolean {
   const { code: pgCode } = extractErrorDetails(err);
   // Do not silently hide SQL data/syntax bugs (22xxx, 23xxx, 42xxx),
   // but fail over cleanly on any connection, network, quota, or server availability error.
-  if (pgCode && (/^(22|23|42)/.test(pgCode))) {
+  if (pgCode && /^(22|23|42)/.test(pgCode)) {
     return false;
   }
   return info.code === 'DB_UNAVAILABLE';
@@ -448,6 +500,15 @@ export async function dbCheckHealth(): Promise<{
   message?: string;
   failoverFromPostgres?: boolean;
 }> {
+  if (!usePostgres && !CAN_FAILOVER_TO_LOCAL) {
+    const err = createVercelMissingDbError();
+    return {
+      ok: false,
+      engine: 'postgresql',
+      code: err.code,
+      message: err.message,
+    };
+  }
   if (getIsUsingPostgres() && pgPool) {
     try {
       await ensurePgSchema();
@@ -457,12 +518,12 @@ export async function dbCheckHealth(): Promise<{
       if (pgFailedOver || shouldFailoverPgError(err)) {
         activatePgFailover(err);
       } else {
-        const e = err as { code?: string; message?: string };
+        const info = classifyDbError(err);
         return {
           ok: false,
           engine: 'postgresql',
-          code: e?.code,
-          message: (e?.message || String(err)).replace(/postgres(?:ql)?:\/\/\S+/gi, '[redacted]'),
+          code: info.code,
+          message: info.userMessage,
         };
       }
     }
@@ -559,6 +620,22 @@ function tryOpenSqlite(
     }
     db.exec(`PRAGMA synchronous = NORMAL;`);
     db.exec(SQLITE_SCHEMA_SQL);
+    // Verify real write capability so read-only files or broken WAL sidecars are rejected immediately.
+    db.exec('BEGIN IMMEDIATE');
+    try {
+      db.prepare(
+        `INSERT INTO cbt_meta (key, value) VALUES ('_write_probe', ?)
+         ON CONFLICT (key) DO UPDATE SET value = excluded.value`
+      ).run(String(Date.now()));
+      db.exec('COMMIT');
+    } catch (writeErr) {
+      try {
+        db.exec('ROLLBACK');
+      } catch {
+        // ignore rollback failure
+      }
+      throw writeErr;
+    }
     return db;
   } catch (err) {
     try {
@@ -571,6 +648,9 @@ function tryOpenSqlite(
 }
 
 async function getSqliteDb(): Promise<SqliteDatabaseSync> {
+  if (!usePostgres && !CAN_FAILOVER_TO_LOCAL) {
+    throw createVercelMissingDbError();
+  }
   if (sqliteDb) {
     return sqliteDb;
   }
@@ -578,8 +658,22 @@ async function getSqliteDb(): Promise<SqliteDatabaseSync> {
     sqliteDbPromise = (async () => {
       const { DatabaseSync } = await loadSqliteModule();
       const candidates = resolveWritableDbCandidates();
+      const primaryDbPath = path.resolve(process.cwd(), 'data', 'candycbt-runtime.db');
       let lastError: unknown;
       for (const dbPath of candidates) {
+        // If falling back away from a read-only primary SQLite file to tmpdir, copy it if destination doesn't exist yet.
+        if (
+          dbPath !== primaryDbPath &&
+          dbPath !== ':memory:' &&
+          !fs.existsSync(dbPath) &&
+          fs.existsSync(primaryDbPath)
+        ) {
+          try {
+            fs.copyFileSync(primaryDbPath, dbPath);
+          } catch {
+            // ignore copy failure and start fresh
+          }
+        }
         for (const mode of (dbPath === ':memory:' ? ['DELETE'] : ['WAL', 'DELETE']) as ('WAL' | 'DELETE')[]) {
           try {
             sqliteDb = tryOpenSqlite(DatabaseSync, dbPath, mode);
@@ -888,11 +982,11 @@ export async function dbLoadDocsAndPresence(): Promise<{
                SELECT x.collection, x.id, x.pos, x.data
                FROM jsonb_to_recordset($1::jsonb) AS x(collection text, id text, pos double precision, data jsonb)
                ON CONFLICT (collection, id) DO NOTHING`,
-              [JSON.stringify(legacy.docs)]
+              [sanitizeJsonForPg(legacy.docs)]
             );
             const vBump = await pgPool!.query<{ value: string }>(
               `INSERT INTO cbt_meta (key, value) VALUES ('docs_version', '1')
-               ON CONFLICT (key) DO UPDATE SET value = ((cbt_meta.value::bigint) + 1)::text
+               ON CONFLICT (key) DO UPDATE SET value = ((CASE WHEN cbt_meta.value ~ '^[0-9]+$' THEN cbt_meta.value::bigint ELSE 0 END) + 1)::text
                RETURNING value`
             );
             version = Number(vBump.rows[0]?.value || 1);
@@ -966,7 +1060,7 @@ export async function dbFlushChanges(
                FROM jsonb_to_recordset($1::jsonb) AS x(collection text, id text, pos double precision, data jsonb)
                ON CONFLICT (collection, id) DO UPDATE
                SET pos = EXCLUDED.pos, data = EXCLUDED.data, updated_at = now()`,
-              [JSON.stringify(upserts)]
+              [sanitizeJsonForPg(upserts)]
             );
           }
           if (deletes.length > 0) {
@@ -974,7 +1068,7 @@ export async function dbFlushChanges(
               `DELETE FROM cbt_docs d
                USING jsonb_to_recordset($1::jsonb) AS x(collection text, id text)
                WHERE d.collection = x.collection AND d.id = x.id`,
-              [JSON.stringify(deletes)]
+              [sanitizeJsonForPg(deletes)]
             );
           }
           if (events.length > 0) {
@@ -982,14 +1076,14 @@ export async function dbFlushChanges(
               `INSERT INTO cbt_events (audience, event, payload)
                SELECT x.audience, x.event, x.payload
                FROM jsonb_to_recordset($1::jsonb) AS x(audience text, event text, payload jsonb)`,
-              [JSON.stringify(events.map((e) => ({ ...e, payload: e.payload ?? null })))]
+              [sanitizeJsonForPg(events.map((e) => ({ ...e, payload: e.payload ?? null })))]
             );
           }
           let nextVersion: number | null = null;
           if (upserts.length > 0 || deletes.length > 0) {
             const vRes = await client.query<{ value: string }>(
               `INSERT INTO cbt_meta (key, value) VALUES ('docs_version', '1')
-               ON CONFLICT (key) DO UPDATE SET value = ((cbt_meta.value::bigint) + 1)::text
+               ON CONFLICT (key) DO UPDATE SET value = ((CASE WHEN cbt_meta.value ~ '^[0-9]+$' THEN cbt_meta.value::bigint ELSE 0 END) + 1)::text
                RETURNING value`
             );
             nextVersion = Number(vRes.rows[0]?.value || 1);

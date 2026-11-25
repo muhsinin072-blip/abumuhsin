@@ -193,7 +193,13 @@ app.use('/api', async (req: Request, res: Response, next: NextFunction) => {
           res.status(info.retryable ? 500 : 503);
           res.setHeader('Content-Type', 'application/json; charset=utf-8');
           originalSend(
-            JSON.stringify({ error: info.retryable ? 'Perubahan gagal disimpan ke database. Silakan coba lagi.' : info.userMessage, code: info.code, retryable: info.retryable })
+            JSON.stringify({
+              error: info.retryable
+                ? `Perubahan gagal disimpan ke database (${info.code}). Silakan coba lagi.`
+                : info.userMessage,
+              code: info.code,
+              retryable: info.retryable,
+            })
           );
         }
       });
@@ -3266,6 +3272,7 @@ app.use('/api', (req: Request, res: Response) => {
 });
 
 app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
+  store.discard();
   const errObj = err as { status?: number; statusCode?: number; type?: string; message?: string };
   const statusCode =
     typeof errObj?.statusCode === 'number'

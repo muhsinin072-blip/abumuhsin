@@ -27,7 +27,14 @@ function deriveRuntimeSigningSecret(): string | null {
   ].filter((v): v is string => Boolean(v && v.length >= 6));
 
   if (secretInputs.length === 0) {
-    return null;
+    const scopeFallback =
+      process.env.VERCEL_PROJECT_ID?.trim() ||
+      process.env.K_SERVICE?.trim() ||
+      process.env.APPLET_ID?.trim();
+    if (!scopeFallback) {
+      return null;
+    }
+    secretInputs.push(scopeFallback);
   }
 
   const deploymentScope = process.env.APPLET_ID?.trim() || 'candycbt';
