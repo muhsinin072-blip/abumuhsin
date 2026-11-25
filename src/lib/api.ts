@@ -75,6 +75,14 @@ function isLoginEndpoint(url: string): boolean {
   );
 }
 
+function isIdempotentPost(url: string): boolean {
+  return (
+    isLoginEndpoint(url) ||
+    /^\/api\/student\/sessions\/[^/]+\/(answer|finish)$/.test(url) ||
+    url === '/api/events'
+  );
+}
+
 function handleUnauthorizedResponse(url: string, errMsg: string): void {
   if (isLoginEndpoint(url) || !memoryToken) {
     return;
@@ -154,8 +162,9 @@ function formatNetworkErrorMessage(err: unknown): string {
 export async function apiFetch<T>(url: string, options: RequestInit = {}): Promise<T> {
   const method = (options.method || 'GET').toUpperCase();
   const isReadMethod = method === 'GET' || method === 'HEAD';
-  const canRetryNetwork = isReadMethod || isLoginEndpoint(url);
-  const maxAttempts = isReadMethod ? 3 : 2;
+  const idempotentWrite = method === 'POST' && isIdempotentPost(url);
+  const canRetryNetwork = isReadMethod || idempotentWrite;
+  const maxAttempts = isReadMethod ? 3 : idempotentWrite ? 3 : 2;
   const timeoutMs = isReadMethod ? 15_000 : 25_000;
   let lastError: Error | null = null;
   let verifiedSessionAfter401 = false;
@@ -223,9 +232,10 @@ export async function apiFetch<T>(url: string, options: RequestInit = {}): Promi
             }
             throw new Error(errMsg);
           }
-          const canRetryStatus = isReadMethod
-            ? TRANSIENT_HTTP_STATUS.has(res.status)
-            : res.status === 503;
+          const canRetryStatus =
+            isReadMethod || idempotentWrite
+              ? TRANSIENT_HTTP_STATUS.has(res.status)
+              : res.status === 503;
           const shouldRetry = data?.retryable !== false && canRetryStatus;
           if (attempt < maxAttempts - 1 && shouldRetry) {
             lastError = new Error(errMsg);
@@ -265,7 +275,11 @@ export async function apiFetch<T>(url: string, options: RequestInit = {}): Promi
           }
           throw new Error(errMsg);
         }
-        if (attempt < maxAttempts - 1 && isReadMethod && TRANSIENT_HTTP_STATUS.has(res.status)) {
+        if (
+          attempt < maxAttempts - 1 &&
+          (isReadMethod || idempotentWrite) &&
+          TRANSIENT_HTTP_STATUS.has(res.status)
+        ) {
           lastError = new Error(errMsg);
           await delayMs(250 * (attempt + 1) + Math.floor(Math.random() * 200));
           continue;

@@ -68,7 +68,7 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
   const [submitting, setSubmitting] = useState(false);
   const [finishSummary, setFinishSummary] = useState<FinishResponse | null>(null);
   const [wsConnected, setWsConnected] = useState(false);
-  const [savingIndicator, setSavingIndicator] = useState<'idle' | 'saving' | 'saved'>('idle');
+  const [savingIndicator, setSavingIndicator] = useState<'idle' | 'saving' | 'saved' | 'retrying'>('idle');
   const [isFullscreen, setIsFullscreen] = useState<boolean>(Boolean(document.fullscreenElement));
 
   const lastViolationStamp = useRef<number>(0);
@@ -77,10 +77,186 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
   const currentIdxRef = useRef<number>(currentIdx);
   const statusRef = useRef<ExamSessionStatus>(status);
   const answersRef = useRef(answers);
+  const lastServerActivityRef = useRef<number>(Date.now());
+  const lastSentQuestionIdxRef = useRef<number>(initialData.session.currentQuestionIndex || 0);
+  const pendingAnswersRef = useRef<
+    Map<
+      string,
+      {
+        questionId: string;
+        answer: string;
+        isDoubtful: boolean;
+        idx: number;
+        updatedAt: string;
+      }
+    >
+  >(new Map());
+  const flushLoopPromiseRef = useRef<Promise<void> | null>(null);
+  const retryTimerRef = useRef<number | null>(null);
+  const unmountedRef = useRef<boolean>(false);
 
   currentIdxRef.current = currentIdx;
   statusRef.current = status;
   answersRef.current = answers;
+
+  const draftStorageKey = `candycbt_draft_${sessionId}`;
+
+  const saveDraftToStorage = useCallback(() => {
+    try {
+      const items = Array.from(pendingAnswersRef.current.values());
+      if (items.length === 0) {
+        window.localStorage.removeItem(draftStorageKey);
+      } else {
+        window.localStorage.setItem(draftStorageKey, JSON.stringify(items));
+      }
+    } catch {
+      // ignore storage errors in restricted iframes
+    }
+  }, [draftStorageKey]);
+
+  const clearDraftStorage = useCallback(() => {
+    pendingAnswersRef.current.clear();
+    try {
+      window.localStorage.removeItem(draftStorageKey);
+    } catch {
+      // ignore storage errors
+    }
+  }, [draftStorageKey]);
+
+  const flushPendingAnswers = useCallback(
+    async (maxFailures = Infinity): Promise<void> => {
+      if (flushLoopPromiseRef.current) {
+        return flushLoopPromiseRef.current;
+      }
+      if (pendingAnswersRef.current.size === 0) {
+        return;
+      }
+      if (retryTimerRef.current !== null) {
+        window.clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = null;
+      }
+
+      const run = (async () => {
+        let consecutiveFailures = 0;
+        while (!unmountedRef.current && pendingAnswersRef.current.size > 0) {
+          if (statusRef.current !== 'SEDANG_UJIAN') {
+            break;
+          }
+          const firstEntry = pendingAnswersRef.current.values().next().value;
+          if (!firstEntry) break;
+
+          setSavingIndicator('saving');
+          try {
+            await apiFetch(`/api/student/sessions/${sessionId}/answer`, {
+              method: 'POST',
+              body: JSON.stringify({
+                questionId: firstEntry.questionId,
+                answer: firstEntry.answer,
+                isDoubtful: firstEntry.isDoubtful,
+                currentQuestionIndex: firstEntry.idx,
+              }),
+            });
+            lastServerActivityRef.current = Date.now();
+            lastSentQuestionIdxRef.current = firstEntry.idx;
+            consecutiveFailures = 0;
+
+            const latest = pendingAnswersRef.current.get(firstEntry.questionId);
+            if (latest && latest.updatedAt === firstEntry.updatedAt) {
+              pendingAnswersRef.current.delete(firstEntry.questionId);
+              saveDraftToStorage();
+            }
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : '';
+            if (/status ujian|id soal tidak valid|sesi ujian tidak ditemukan|kedaluwarsa/i.test(msg)) {
+              pendingAnswersRef.current.delete(firstEntry.questionId);
+              saveDraftToStorage();
+              continue;
+            }
+            consecutiveFailures += 1;
+            setSavingIndicator('retrying');
+            if (consecutiveFailures >= maxFailures) {
+              break;
+            }
+            const backoffMs = Math.min(8_000, 1_200 * Math.pow(2, consecutiveFailures - 1));
+            await new Promise<void>((resolve) => {
+              retryTimerRef.current = window.setTimeout(() => {
+                retryTimerRef.current = null;
+                resolve();
+              }, backoffMs);
+            });
+          }
+        }
+
+        if (!unmountedRef.current) {
+          if (pendingAnswersRef.current.size === 0) {
+            setSavingIndicator('saved');
+          } else {
+            setSavingIndicator('retrying');
+          }
+        }
+      })().finally(() => {
+        flushLoopPromiseRef.current = null;
+      });
+
+      flushLoopPromiseRef.current = run;
+      return run;
+    },
+    [saveDraftToStorage, sessionId]
+  );
+
+  // Recover any locally queued unsynced answers from accidental reload/disconnect
+  useEffect(() => {
+    unmountedRef.current = false;
+    if (initialData.session.status === 'SELESAI') {
+      clearDraftStorage();
+      return () => {
+        unmountedRef.current = true;
+      };
+    }
+    try {
+      const raw = window.localStorage.getItem(draftStorageKey);
+      if (raw) {
+        const parsed = JSON.parse(raw) as {
+          questionId: string;
+          answer: string;
+          isDoubtful: boolean;
+          idx: number;
+          updatedAt: string;
+        }[];
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          const recovered: Record<string, { questionId: string; answer: string; isDoubtful: boolean; updatedAt: string }> = {};
+          for (const item of parsed) {
+            if (!item?.questionId) continue;
+            const serverTs = initialData.session.answers?.[item.questionId]?.updatedAt || '';
+            if (!serverTs || item.updatedAt > serverTs) {
+              pendingAnswersRef.current.set(item.questionId, item);
+              recovered[item.questionId] = {
+                questionId: item.questionId,
+                answer: item.answer,
+                isDoubtful: Boolean(item.isDoubtful),
+                updatedAt: item.updatedAt,
+              };
+            }
+          }
+          if (Object.keys(recovered).length > 0) {
+            setAnswers((prev) => ({ ...prev, ...recovered }));
+            void flushPendingAnswers();
+          } else {
+            window.localStorage.removeItem(draftStorageKey);
+          }
+        }
+      }
+    } catch {
+      // ignore malformed draft
+    }
+    return () => {
+      unmountedRef.current = true;
+      if (retryTimerRef.current !== null) {
+        window.clearTimeout(retryTimerRef.current);
+        retryTimerRef.current = null;
+      }
+    };
+  }, [clearDraftStorage, draftStorageKey, flushPendingAnswers, initialData.session.answers, initialData.session.status]);
 
   const currentQuestion = questions[currentIdx];
   const currentAnswer = currentQuestion ? answers[currentQuestion.id]?.answer || '' : '';
@@ -111,21 +287,24 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
         if (activeQ && activeQ.type === 'ESAI') {
           const rec = answersRef.current[activeQ.id];
           if (rec) {
-            await apiFetch(`/api/student/sessions/${sessionId}/answer`, {
-              method: 'POST',
-              body: JSON.stringify({
-                questionId: activeQ.id,
-                answer: rec.answer || '',
-                isDoubtful: Boolean(rec.isDoubtful),
-                currentQuestionIndex: currentIdxRef.current,
-              }),
-            }).catch(() => undefined);
+            pendingAnswersRef.current.set(activeQ.id, {
+              questionId: activeQ.id,
+              answer: rec.answer || '',
+              isDoubtful: Boolean(rec.isDoubtful),
+              idx: currentIdxRef.current,
+              updatedAt: rec.updatedAt || new Date().toISOString(),
+            });
+            saveDraftToStorage();
           }
         }
+      }
+      if (pendingAnswersRef.current.size > 0) {
+        await flushPendingAnswers(2);
       }
       const res = await apiFetch<FinishResponse>(`/api/student/sessions/${sessionId}/finish`, {
         method: 'POST',
       });
+      clearDraftStorage();
       setStatus('SELESAI');
       setFinishSummary(res);
       setConfirmFinishOpen(false);
@@ -137,7 +316,7 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
     } finally {
       setSubmitting(false);
     }
-  }, [questions, sessionId, submitting]);
+  }, [clearDraftStorage, flushPendingAnswers, questions, saveDraftToStorage, sessionId, submitting]);
 
   const handleFinishExamRef = useRef(handleFinishExam);
   handleFinishExamRef.current = handleFinishExam;
@@ -191,14 +370,21 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
     );
     wsRef.current = client;
 
+    const heartbeatJitterMs = Math.floor(Math.random() * 5_000);
     const heartbeat = window.setInterval(() => {
       if (statusRef.current === 'SEDANG_UJIAN' || statusRef.current === 'TERBLOKIR') {
-        client.send('student:heartbeat', {
-          sessionId,
-          currentQuestionIndex: currentIdxRef.current,
-        });
+        const idleMs = Date.now() - lastServerActivityRef.current;
+        const questionChanged = lastSentQuestionIdxRef.current !== currentIdxRef.current;
+        if (idleMs >= 35_000 || questionChanged) {
+          lastServerActivityRef.current = Date.now();
+          lastSentQuestionIdxRef.current = currentIdxRef.current;
+          client.send('student:heartbeat', {
+            sessionId,
+            currentQuestionIndex: currentIdxRef.current,
+          });
+        }
       }
-    }, 15_000);
+    }, 40_000 + heartbeatJitterMs);
 
     return () => {
       window.clearInterval(heartbeat);
@@ -309,68 +495,75 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
     };
   }, [exam.antiCheatEnabled, reportViolation, status]);
 
-  const persistAnswer = async (
+  const persistAnswer = (
     questionId: string,
     answer: string,
     isDoubtful: boolean,
-    idx: number
+    idx: number,
+    updatedAt: string
   ) => {
-    setSavingIndicator('saving');
-    try {
-      await apiFetch(`/api/student/sessions/${sessionId}/answer`, {
-        method: 'POST',
-        body: JSON.stringify({
-          questionId,
-          answer,
-          isDoubtful,
-          currentQuestionIndex: idx,
-        }),
-      });
-      setSavingIndicator('saved');
-    } catch {
-      setSavingIndicator('idle');
-    }
+    pendingAnswersRef.current.set(questionId, {
+      questionId,
+      answer,
+      isDoubtful,
+      idx,
+      updatedAt,
+    });
+    saveDraftToStorage();
+    void flushPendingAnswers();
   };
 
   const handleSelectOption = (originalKey: string) => {
     if (!currentQuestion || status !== 'SEDANG_UJIAN') return;
+    const updatedAt = new Date().toISOString();
     const nextRecord = {
       questionId: currentQuestion.id,
       answer: originalKey,
       isDoubtful: currentDoubtful,
-      updatedAt: new Date().toISOString(),
+      updatedAt,
     };
     setAnswers((prev) => ({ ...prev, [currentQuestion.id]: nextRecord }));
-    persistAnswer(currentQuestion.id, originalKey, currentDoubtful, currentIdx);
+    persistAnswer(currentQuestion.id, originalKey, currentDoubtful, currentIdx, updatedAt);
   };
 
   const handleToggleDoubtful = () => {
     if (!currentQuestion || status !== 'SEDANG_UJIAN') return;
     const nextDoubt = !currentDoubtful;
+    const updatedAt = new Date().toISOString();
     const nextRecord = {
       questionId: currentQuestion.id,
       answer: currentAnswer,
       isDoubtful: nextDoubt,
-      updatedAt: new Date().toISOString(),
+      updatedAt,
     };
     setAnswers((prev) => ({ ...prev, [currentQuestion.id]: nextRecord }));
-    persistAnswer(currentQuestion.id, currentAnswer, nextDoubt, currentIdx);
+    persistAnswer(currentQuestion.id, currentAnswer, nextDoubt, currentIdx, updatedAt);
   };
 
   const handleEssayChange = (text: string) => {
     if (!currentQuestion || status !== 'SEDANG_UJIAN') return;
+    const updatedAt = new Date().toISOString();
     const nextRecord = {
       questionId: currentQuestion.id,
       answer: text,
       isDoubtful: currentDoubtful,
-      updatedAt: new Date().toISOString(),
+      updatedAt,
     };
     setAnswers((prev) => ({ ...prev, [currentQuestion.id]: nextRecord }));
+    pendingAnswersRef.current.set(currentQuestion.id, {
+      questionId: currentQuestion.id,
+      answer: text,
+      isDoubtful: currentDoubtful,
+      idx: currentIdx,
+      updatedAt,
+    });
+    saveDraftToStorage();
     if (essayDebounceRef.current) {
       window.clearTimeout(essayDebounceRef.current);
     }
     essayDebounceRef.current = window.setTimeout(() => {
-      persistAnswer(currentQuestion.id, text, currentDoubtful, currentIdx);
+      essayDebounceRef.current = null;
+      void flushPendingAnswers();
     }, 500);
   };
 
@@ -582,11 +775,13 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
               <span className="text-xs text-slate-500">
                 {savingIndicator === 'saving'
                   ? 'Menyimpan...'
-                  : savingIndicator === 'saved'
-                    ? 'Tersimpan'
-                    : wsConnected
-                      ? 'Terhubung Server'
-                      : 'Mode Offline Cache'}
+                  : savingIndicator === 'retrying'
+                    ? 'Menyimpan ulang...'
+                    : savingIndicator === 'saved'
+                      ? 'Tersimpan'
+                      : wsConnected
+                        ? 'Terhubung Server'
+                        : 'Mode Offline Cache'}
               </span>
               <div className="flex items-center border border-slate-300 rounded-md overflow-hidden bg-white">
                 {(['sm', 'md', 'lg'] as const).map((sz) => (

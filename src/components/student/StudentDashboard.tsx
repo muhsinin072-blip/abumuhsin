@@ -70,9 +70,11 @@ export const StudentDashboard: React.FC<StudentDashboardProps> = ({
     }
   };
 
-  const loadExams = useCallback(async () => {
-    setLoading(true);
-    setError('');
+  const loadExams = useCallback(async (silent = false) => {
+    if (!silent) {
+      setLoading(true);
+      setError('');
+    }
     try {
       const [examRes, matRes] = await Promise.all([
         apiFetch<{
@@ -86,10 +88,13 @@ export const StudentDashboard: React.FC<StudentDashboardProps> = ({
       setExams(examRes.exams);
       setBroadcasts(examRes.broadcasts || []);
       setMaterials(matRes.materials || []);
+      if (silent) setError('');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Gagal memuat daftar ujian.');
+      if (!silent) {
+        setError(err instanceof Error ? err.message : 'Gagal memuat daftar ujian.');
+      }
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }, []);
 
@@ -97,7 +102,7 @@ export const StudentDashboard: React.FC<StudentDashboardProps> = ({
     loadExams();
     const ws = createCbtWebSocket((event, payload) => {
       if (event === 'exams:updated' || event === 'materials:updated' || event === 'admin:command') {
-        loadExams();
+        loadExams(true);
       } else if (event === 'admin:broadcast' && payload) {
         const noticeItem = payload as BroadcastNotice;
         setBroadcasts((prev) => [noticeItem, ...prev.slice(0, 4)]);
@@ -202,7 +207,7 @@ export const StudentDashboard: React.FC<StudentDashboardProps> = ({
             </button>
             <button
               type="button"
-              onClick={loadExams}
+              onClick={() => void loadExams()}
               className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg border border-slate-300/80 bg-white/90 hover:bg-slate-50 text-sm font-semibold text-slate-700 whitespace-nowrap shrink-0 transition-colors"
             >
               <RefreshCw className="w-4 h-4" />
@@ -372,7 +377,7 @@ export const StudentDashboard: React.FC<StudentDashboardProps> = ({
                       </div>
                       <button
                         type="button"
-                        onClick={loadExams}
+                        onClick={() => void loadExams()}
                         className="text-xs font-semibold text-red-700 underline whitespace-nowrap"
                       >
                         Cek Status

@@ -87,7 +87,7 @@ app.use('/api', (req: Request, res: Response, next: NextFunction) => {
 
 const STAFF_AUDIENCE = 'staff';
 const STUDENTS_AUDIENCE = 'students';
-const ONLINE_TIMEOUT_MS = 35_000;
+const ONLINE_TIMEOUT_MS = 90_000;
 
 function sendToAdmins(event: string, payload: unknown): void {
   store.emit(STAFF_AUDIENCE, event, payload);
@@ -130,7 +130,7 @@ async function touchPresence(user: TokenPayload): Promise<void> {
 }
 
 let lastMiddlewareMaintenanceAt = 0;
-const MAINTENANCE_INTERVAL_MS = 15_000;
+const MAINTENANCE_INTERVAL_MS = 30_000;
 const lastDbWarnByCode = new Map<string, number>();
 
 function reportDbUnavailable(context: string, err: unknown) {
@@ -1008,6 +1008,7 @@ app.post('/api/student/sessions/:sessionId/answer', requireAuth, requireStudent,
     updatedAt: new Date().toISOString(),
   };
   session.currentQuestionIndex = currentQuestionIndex;
+  session.isOnline = true;
   session.lastHeartbeatAt = new Date().toISOString();
   store.commit();
 
@@ -3253,10 +3254,10 @@ app.post('/api/events', requireAuth, (req: AuthenticatedRequest, res) => {
         sess.currentQuestionIndex = currentIdx;
       }
 
-      if (wasOffline || questionChanged || now - prevHeartbeatMs >= 12_000) {
+      if (wasOffline || questionChanged || now - prevHeartbeatMs >= 45_000) {
         store.commit();
       }
-      if (wasOffline || questionChanged || now - prevEmitMs >= 20_000) {
+      if (wasOffline || questionChanged || now - prevEmitMs >= 30_000) {
         lastHeartbeatEmitAt.set(sess.id, now);
         sendToAdmins('session:updated', sess);
       }
