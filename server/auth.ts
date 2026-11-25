@@ -1,10 +1,21 @@
 import crypto from 'node:crypto';
 import type { UserRole } from '../src/types/cbt.ts';
-import { dbInitSessionSecret, dbReadLocalSessionSecret, getIsUsingPostgres } from './db.ts';
+import {
+  dbInitSessionSecret,
+  dbReadLocalSessionSecret,
+  getIsUsingPostgres,
+  onDbEngineFailover,
+} from './db.ts';
 
 let sharedSecret: string | null = null;
 let sharedSecretLoading: Promise<string> | null = null;
 const verificationSecrets = new Set<string>();
+
+onDbEngineFailover(() => {
+  dbReadLocalSessionSecret()
+    .then((localSecret) => registerVerificationSecret(localSecret))
+    .catch(() => undefined);
+});
 
 function deriveRuntimeSigningSecret(): string | null {
   const secretInputs = [

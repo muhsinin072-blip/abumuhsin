@@ -359,7 +359,33 @@ export function classifyDbError(err: unknown): DbErrorClassification {
 
 function shouldFailoverPgError(err: unknown): boolean {
   if (!CAN_FAILOVER_TO_LOCAL) return false;
-  return classifyDbError(err).code === 'DB_QUOTA_EXCEEDED';
+  const info = classifyDbError(err);
+  if (info.code === 'DB_QUOTA_EXCEEDED' || info.code === 'DB_CONFIG_ERROR') {
+    return true;
+  }
+  if (info.code === 'DB_UNAVAILABLE') {
+    const e = (err && typeof err === 'object' ? err : {}) as { code?: string; message?: string };
+    const pgCode = typeof e.code === 'string' ? e.code : '';
+    const msg = (e.message || '').toLowerCase();
+    return (
+      pgCode === 'ECONNREFUSED' ||
+      pgCode === 'ENOTFOUND' ||
+      pgCode === 'EAI_AGAIN' ||
+      pgCode === 'ETIMEDOUT' ||
+      pgCode === 'EHOSTUNREACH' ||
+      pgCode === 'ENETUNREACH' ||
+      pgCode.startsWith('08') ||
+      pgCode.startsWith('57P') ||
+      msg.includes('password authentication failed') ||
+      msg.includes('could not connect') ||
+      msg.includes('connection timeout') ||
+      msg.includes('timeout exceeded') ||
+      msg.includes('getaddrinfo') ||
+      msg.includes('self-signed certificate') ||
+      msg.includes('does not support ssl')
+    );
+  }
+  return false;
 }
 
 function activatePgFailover(err: unknown): void {
@@ -368,8 +394,13 @@ function activatePgFailover(err: unknown): void {
   pgFailedOver = true;
   pgFailoverReason = info.logSummary;
   console.warn(
-    `[CBT DB] Kuota PostgreSQL/Neon pada DATABASE_URL terlampaui (${info.code}); mengaktifkan failover database lokal SQLite agar login dan ujian tetap berjalan.`
+    `[CBT DB] PostgreSQL pada DATABASE_URL gagal (${info.code}: ${info.logSummary}); mengaktifkan failover database lokal SQLite agar login dan ujian tetap berjalan.`
   );
+  if (pgPool) {
+    const poolToClose = pgPool;
+    globalThis.__candyCbtPgPool = undefined;
+    poolToClose.end().catch(() => undefined);
+  }
   for (const listener of failoverListeners) {
     try {
       listener();
@@ -392,7 +423,7 @@ export async function dbCheckHealth(): Promise<{
       await pgPool.query('SELECT 1');
       return { ok: true, engine: 'postgresql' };
     } catch (err) {
-      if (shouldFailoverPgError(err)) {
+      if (pgFailedOver || shouldFailoverPgError(err)) {
         activatePgFailover(err);
       } else {
         const e = err as { code?: string; message?: string };
@@ -671,7 +702,7 @@ export async function dbInitSessionSecret(candidate: string): Promise<string> {
         return rows[0]?.value || initialSecret;
       });
     } catch (err) {
-      if (shouldFailoverPgError(err)) {
+      if (pgFailedOver || shouldFailoverPgError(err)) {
         activatePgFailover(err);
       } else {
         throw err;
@@ -701,7 +732,7 @@ export async function dbTouchPresence(userId: string, role: string): Promise<voi
       });
       return;
     } catch (err) {
-      if (shouldFailoverPgError(err)) {
+      if (pgFailedOver || shouldFailoverPgError(err)) {
         activatePgFailover(err);
       } else {
         throw err;
@@ -728,7 +759,7 @@ export async function dbGetDocsVersion(): Promise<number> {
         return Number(rows[0]?.value || 0);
       });
     } catch (err) {
-      if (shouldFailoverPgError(err)) {
+      if (pgFailedOver || shouldFailoverPgError(err)) {
         activatePgFailover(err);
       } else {
         throw err;
@@ -754,7 +785,7 @@ export async function dbLoadPresence(): Promise<{ students: number; staff: numbe
         return presence;
       });
     } catch (err) {
-      if (shouldFailoverPgError(err)) {
+      if (pgFailedOver || shouldFailoverPgError(err)) {
         activatePgFailover(err);
       } else {
         throw err;
@@ -830,7 +861,7 @@ export async function dbLoadDocsAndPresence(): Promise<{
         return { docs: docsRes.rows, presence, version };
       });
     } catch (err) {
-      if (shouldFailoverPgError(err)) {
+      if (pgFailedOver || shouldFailoverPgError(err)) {
         activatePgFailover(err);
       } else {
         throw err;
@@ -928,7 +959,7 @@ export async function dbFlushChanges(
         }
       });
     } catch (err) {
-      if (shouldFailoverPgError(err)) {
+      if (pgFailedOver || shouldFailoverPgError(err)) {
         activatePgFailover(err);
       } else {
         throw err;
@@ -1010,7 +1041,7 @@ export async function dbGetMaxEventId(): Promise<number> {
         return Number(rows[0]?.max || 0);
       });
     } catch (err) {
-      if (shouldFailoverPgError(err)) {
+      if (pgFailedOver || shouldFailoverPgError(err)) {
         activatePgFailover(err);
       } else {
         throw err;
@@ -1084,7 +1115,7 @@ export async function dbPollEventsAfter(
         return { cursor, events };
       });
     } catch (err) {
-      if (shouldFailoverPgError(err)) {
+      if (pgFailedOver || shouldFailoverPgError(err)) {
         activatePgFailover(err);
       } else {
         throw err;

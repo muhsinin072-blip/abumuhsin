@@ -179,6 +179,7 @@ export async function apiFetch<T>(url: string, options: RequestInit = {}): Promi
                 }
                 throw new Error(errMsg);
               }
+              handleUnauthorizedResponse(url, errMsg);
             }
             throw new Error(errMsg);
           }
@@ -212,6 +213,8 @@ export async function apiFetch<T>(url: string, options: RequestInit = {}): Promi
               if (check === 'invalid') {
                 handleUnauthorizedResponse(url, sessionMsg);
               }
+            } else {
+              handleUnauthorizedResponse(url, sessionMsg);
             }
           }
           throw new Error(errMsg);
