@@ -41,6 +41,7 @@ export const HasilLaporan: React.FC<HasilLaporanProps> = ({ userRole = 'admin' }
     try {
       const res = await apiFetch<AdminResultsResponse>('/api/admin/results');
       setData(res);
+      setError('');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Gagal memuat hasil ujian.');
     } finally {

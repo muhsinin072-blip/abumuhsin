@@ -117,6 +117,7 @@ export const ServerManager: React.FC<ServerManagerProps> = ({ onSettingsUpdated 
       if (res.counts) {
         setCounts(res.counts);
       }
+      setError('');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Gagal memuat status server.');
     }

@@ -46,8 +46,10 @@ export default function App() {
       setPublicInfo(info);
       setStartupError('');
       applyCbtTheme(info?.settings?.themeColor);
+      return true;
     } catch (err) {
       setStartupError(err instanceof Error ? err.message : '');
+      return false;
     }
   }, []);
 
@@ -66,7 +68,13 @@ export default function App() {
   useEffect(() => {
     let active = true;
     const bootstrap = async () => {
-      await loadPublicInfo();
+      let ok = await loadPublicInfo();
+      if (!ok && active) {
+        await new Promise((r) => window.setTimeout(r, 1500));
+        if (active) {
+          ok = await loadPublicInfo();
+        }
+      }
       const storedToken = getAuthToken();
       if (storedToken) {
         try {

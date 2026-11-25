@@ -40,6 +40,7 @@ export const PesertaManager: React.FC<PesertaManagerProps> = ({ settings }) => {
     try {
       const data = await apiFetch<StudentsResponse>('/api/admin/students');
       setStudents(data.students);
+      setError('');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Gagal memuat data peserta.');
     } finally {

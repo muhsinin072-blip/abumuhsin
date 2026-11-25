@@ -93,9 +93,9 @@ function resolvePostgresConfig(): pg.PoolConfig | null {
     return {
       connectionString: cleanedUrl,
       max: poolMax,
-      connectionTimeoutMillis: 20_000,
-      idleTimeoutMillis: 30_000,
-      query_timeout: 15_000,
+      connectionTimeoutMillis: 8_000,
+      idleTimeoutMillis: 20_000,
+      query_timeout: 10_000,
       keepAlive: true,
       allowExitOnIdle: isServerless,
       ...(useSsl
@@ -127,9 +127,9 @@ function resolvePostgresConfig(): pg.PoolConfig | null {
       user,
       password,
       max: poolMax,
-      connectionTimeoutMillis: 20_000,
-      idleTimeoutMillis: 30_000,
-      query_timeout: 15_000,
+      connectionTimeoutMillis: 8_000,
+      idleTimeoutMillis: 20_000,
+      query_timeout: 10_000,
       keepAlive: true,
       allowExitOnIdle: isServerless,
       ...(useSsl
@@ -173,7 +173,9 @@ if (usePostgres && pgConfig) {
   if (!globalThis.__candyCbtPgPool) {
     globalThis.__candyCbtPgPool = new pg.Pool(pgConfig);
     globalThis.__candyCbtPgPool.on('error', (err) => {
-      console.error('PostgreSQL pool background error:', err);
+      if (!pgFailedOver) {
+        console.warn('PostgreSQL pool background notice:', classifyDbError(err).code);
+      }
     });
     attachDatabasePool(globalThis.__candyCbtPgPool);
   }
@@ -199,24 +201,62 @@ const TRANSIENT_PG_CODES = new Set([
   'EPIPE',
   'ECONNREFUSED',
   'EAI_AGAIN',
+  'ECONNABORTED',
+  'ENETUNREACH',
+  'EHOSTUNREACH',
 ]);
+
+function extractErrorDetails(err: unknown): { code: string; message: string } {
+  if (!err || typeof err !== 'object') {
+    return { code: '', message: String(err || '') };
+  }
+  const e = err as { code?: unknown; message?: unknown; errors?: unknown; cause?: unknown };
+  let code = typeof e.code === 'string' ? e.code : '';
+  let message = typeof e.message === 'string' ? e.message : '';
+
+  if (Array.isArray(e.errors) && e.errors.length > 0) {
+    const nested = e.errors.map((item) => extractErrorDetails(item));
+    if (!code) {
+      code = nested.find((n) => n.code)?.code || '';
+    }
+    if (!message) {
+      message = nested.map((n) => n.message).filter(Boolean).join('; ');
+    }
+  }
+  if ((!code || !message) && e.cause) {
+    const causeDetails = extractErrorDetails(e.cause);
+    if (!code) code = causeDetails.code;
+    if (!message) message = causeDetails.message;
+  }
+  return { code, message: message || String(err) };
+}
 
 function isTransientPgError(err: unknown): boolean {
   if (!err || typeof err !== 'object') return false;
-  const e = err as { code?: string; message?: string };
-  if (e.code && TRANSIENT_PG_CODES.has(e.code)) {
+  const { code, message } = extractErrorDetails(err);
+  if (code && (TRANSIENT_PG_CODES.has(code) || code.startsWith('08'))) {
     return true;
   }
-  const msg = (e.message || '').toLowerCase();
+  const msg = message.toLowerCase();
   return (
     msg.includes('connection terminated') ||
+    msg.includes('connection ended') ||
     msg.includes('terminating connection') ||
     msg.includes('timeout exceeded') ||
     msg.includes('connection timeout') ||
+    msg.includes('query read timeout') ||
     msg.includes('too many clients') ||
+    msg.includes('remaining connection slots') ||
     msg.includes('econnreset') ||
+    msg.includes('etimedout') ||
+    msg.includes('epipe') ||
+    msg.includes('econnrefused') ||
+    msg.includes('eai_again') ||
     msg.includes('socket hang up') ||
-    msg.includes('could not connect')
+    msg.includes('could not connect') ||
+    msg.includes('client has encountered a connection error') ||
+    msg.includes('database system is starting up') ||
+    msg.includes('cannot use a pool after calling end')
   );
 }
 
@@ -321,9 +361,8 @@ export interface DbErrorClassification {
 }
 
 export function classifyDbError(err: unknown): DbErrorClassification {
-  const e = (err && typeof err === 'object' ? err : {}) as { code?: string; message?: string };
-  const pgCode = typeof e.code === 'string' ? e.code : '';
-  const rawMessage = (e.message || String(err || 'Unknown database error')).replace(
+  const { code: pgCode, message: extractedMsg } = extractErrorDetails(err);
+  const rawMessage = (extractedMsg || 'Unknown database error').replace(
     /postgres(?:ql)?:\/\/\S+/gi,
     '[redacted]'
   );
@@ -339,7 +378,15 @@ export function classifyDbError(err: unknown): DbErrorClassification {
     };
   }
 
-  if (pgCode === '28P01' || pgCode === '28000' || pgCode === '3D000' || lower.includes('password authentication failed')) {
+  if (
+    pgCode === '28P01' ||
+    pgCode === '28000' ||
+    pgCode === '3D000' ||
+    pgCode === 'ERR_INVALID_URL' ||
+    lower.includes('password authentication failed') ||
+    lower.includes('no pg_hba.conf entry') ||
+    lower.includes('does not exist')
+  ) {
     return {
       code: 'DB_CONFIG_ERROR',
       retryable: false,
@@ -363,29 +410,13 @@ function shouldFailoverPgError(err: unknown): boolean {
   if (info.code === 'DB_QUOTA_EXCEEDED' || info.code === 'DB_CONFIG_ERROR') {
     return true;
   }
-  if (info.code === 'DB_UNAVAILABLE') {
-    const e = (err && typeof err === 'object' ? err : {}) as { code?: string; message?: string };
-    const pgCode = typeof e.code === 'string' ? e.code : '';
-    const msg = (e.message || '').toLowerCase();
-    return (
-      pgCode === 'ECONNREFUSED' ||
-      pgCode === 'ENOTFOUND' ||
-      pgCode === 'EAI_AGAIN' ||
-      pgCode === 'ETIMEDOUT' ||
-      pgCode === 'EHOSTUNREACH' ||
-      pgCode === 'ENETUNREACH' ||
-      pgCode.startsWith('08') ||
-      pgCode.startsWith('57P') ||
-      msg.includes('password authentication failed') ||
-      msg.includes('could not connect') ||
-      msg.includes('connection timeout') ||
-      msg.includes('timeout exceeded') ||
-      msg.includes('getaddrinfo') ||
-      msg.includes('self-signed certificate') ||
-      msg.includes('does not support ssl')
-    );
+  const { code: pgCode } = extractErrorDetails(err);
+  // Do not silently hide SQL data/syntax bugs (22xxx, 23xxx, 42xxx),
+  // but fail over cleanly on any connection, network, quota, or server availability error.
+  if (pgCode && (/^(22|23|42)/.test(pgCode))) {
+    return false;
   }
-  return false;
+  return info.code === 'DB_UNAVAILABLE';
 }
 
 function activatePgFailover(err: unknown): void {
@@ -393,8 +424,8 @@ function activatePgFailover(err: unknown): void {
   const info = classifyDbError(err);
   pgFailedOver = true;
   pgFailoverReason = info.logSummary;
-  console.warn(
-    `[CBT DB] PostgreSQL pada DATABASE_URL gagal (${info.code}: ${info.logSummary}); mengaktifkan failover database lokal SQLite agar login dan ujian tetap berjalan.`
+  console.info(
+    `[CBT DB] Menggunakan penyimpanan lokal SQLite (fallback aktif dari PostgreSQL: ${info.code}).`
   );
   if (pgPool) {
     const poolToClose = pgPool;
@@ -461,6 +492,7 @@ function loadSqliteModule(): Promise<typeof import('node:sqlite')> {
 }
 
 let sqliteDb: SqliteDatabaseSync | null = null;
+let sqliteDbPromise: Promise<SqliteDatabaseSync> | null = null;
 
 const SQLITE_SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS cbt_docs (
@@ -496,12 +528,13 @@ function resolveWritableDbCandidates(): string[] {
     path.resolve(process.cwd(), 'data'),
     path.join(os.tmpdir(), 'candycbt-data'),
   ];
+  const probeSuffix = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   for (const dir of dirs) {
     try {
       if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
       }
-      const probe = path.join(dir, '.write-check');
+      const probe = path.join(dir, `.write-check-${probeSuffix}`);
       fs.writeFileSync(probe, 'ok');
       fs.unlinkSync(probe);
       paths.push(path.join(dir, 'candycbt-runtime.db'));
@@ -541,21 +574,31 @@ async function getSqliteDb(): Promise<SqliteDatabaseSync> {
   if (sqliteDb) {
     return sqliteDb;
   }
-  const { DatabaseSync } = await loadSqliteModule();
-  const candidates = resolveWritableDbCandidates();
-  let lastError: unknown;
-  for (const dbPath of candidates) {
-    for (const mode of (dbPath === ':memory:' ? ['DELETE'] : ['WAL', 'DELETE']) as ('WAL' | 'DELETE')[]) {
-      try {
-        sqliteDb = tryOpenSqlite(DatabaseSync, dbPath, mode);
-        return sqliteDb;
-      } catch (err) {
-        lastError = err;
-        console.warn(`Gagal membuka SQLite (${dbPath}, mode ${mode}):`, err);
+  if (!sqliteDbPromise) {
+    sqliteDbPromise = (async () => {
+      const { DatabaseSync } = await loadSqliteModule();
+      const candidates = resolveWritableDbCandidates();
+      let lastError: unknown;
+      for (const dbPath of candidates) {
+        for (const mode of (dbPath === ':memory:' ? ['DELETE'] : ['WAL', 'DELETE']) as ('WAL' | 'DELETE')[]) {
+          try {
+            sqliteDb = tryOpenSqlite(DatabaseSync, dbPath, mode);
+            return sqliteDb;
+          } catch (err) {
+            lastError = err;
+            console.warn(`Gagal membuka SQLite (${dbPath}, mode ${mode}):`, err);
+          }
+        }
       }
-    }
+      throw lastError instanceof Error
+        ? lastError
+        : new Error('Gagal menginisialisasi database fallback lokal.');
+    })().catch((err) => {
+      sqliteDbPromise = null;
+      throw err;
+    });
   }
-  throw lastError instanceof Error ? lastError : new Error('Gagal menginisialisasi database fallback lokal.');
+  return sqliteDbPromise;
 }
 
 function isSqliteBusyError(err: unknown): boolean {
@@ -563,6 +606,8 @@ function isSqliteBusyError(err: unknown): boolean {
   const e = err as { code?: string; errcode?: number; message?: string };
   const msg = (e.message || '').toLowerCase();
   return (
+    e.errcode === 5 ||
+    e.errcode === 6 ||
     (e.code === 'ERR_SQLITE_ERROR' && (msg.includes('locked') || msg.includes('busy'))) ||
     msg.includes('database is locked') ||
     msg.includes('sqlite_busy')

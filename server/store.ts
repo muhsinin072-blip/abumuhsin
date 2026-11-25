@@ -1121,6 +1121,7 @@ class StoreManager {
     const totalBytes = Array.from(nextSnapshot.values()).reduce((sum, e) => sum + e.json.length, 0);
     ctx.snapshot = nextSnapshot;
     ctx.sizeBytes = totalBytes;
+    ctx.dirty = false;
     if (cacheTarget) {
       cacheTarget.snapshot = nextSnapshot;
       cacheTarget.sizeBytes = totalBytes;

@@ -40,6 +40,7 @@ export const LiveMonitoring: React.FC = () => {
       setViolations(data.violations);
       setExams(data.exams);
       setMetrics(data.metrics);
+      setError('');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Gagal memuat pemantauan ujian.');
     }

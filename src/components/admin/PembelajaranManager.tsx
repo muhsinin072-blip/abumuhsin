@@ -102,6 +102,7 @@ export const PembelajaranManager: React.FC<PembelajaranManagerProps> = ({
       const res = await apiFetch<MaterialsResponse>('/api/admin/materials');
       setMaterials(res.materials);
       setClasses(res.classes || []);
+      setError('');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Gagal memuat materi pembelajaran.');
     } finally {

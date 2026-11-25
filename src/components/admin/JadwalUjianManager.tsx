@@ -32,6 +32,7 @@ export const JadwalUjianManager: React.FC = () => {
       ]);
       setExams(exRes.exams);
       setBanks(bkRes.banks);
+      setError('');
       setBankId((prev) =>
         prev && bkRes.banks.some((b) => b.id === prev) ? prev : bkRes.banks[0]?.id || ''
       );

@@ -132,7 +132,8 @@ function delayMs(ms: number): Promise<void> {
 }
 
 export async function apiFetch<T>(url: string, options: RequestInit = {}): Promise<T> {
-  const maxAttempts = 3;
+  const method = (options.method || 'GET').toUpperCase();
+  const maxAttempts = method === 'GET' || method === 'HEAD' ? 4 : 3;
   let lastError: Error | null = null;
   let verifiedSessionAfter401 = false;
 

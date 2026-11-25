@@ -82,6 +82,7 @@ export const BankSoalManager: React.FC<BankSoalManagerProps> = ({
       ]);
       setBanks(data.banks);
       setTeachers(tRes.teachers);
+      setError('');
       if (data.banks.length > 0) {
         setSelectedBankId((prev) =>
           data.banks.some((b) => b.id === prev) ? prev : data.banks[0].id

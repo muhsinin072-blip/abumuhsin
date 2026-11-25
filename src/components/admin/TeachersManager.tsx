@@ -43,6 +43,7 @@ export const TeachersManager: React.FC = () => {
     try {
       const res = await apiFetch<TeachersResponse>('/api/admin/teachers');
       setTeachers(res.teachers);
+      setError('');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Gagal memuat daftar guru.');
     } finally {
