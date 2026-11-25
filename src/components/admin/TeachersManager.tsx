@@ -85,35 +85,52 @@ export const TeachersManager: React.FC = () => {
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
     setModalError('');
+    setNotice('');
     setSaving(true);
     try {
+      const trimmedNip = nip.trim();
+      const trimmedName = fullName.trim();
+      const trimmedSubject = subject.trim();
+      const trimmedPassword = password.trim();
+
       if (editingTeacher) {
-        await apiFetch(`/api/admin/teachers/${editingTeacher.id}`, {
-          method: 'PUT',
-          body: JSON.stringify({
-            nip: nip.trim(),
-            fullName: fullName.trim(),
-            subject: subject.trim(),
-            isActive,
-            password: password.trim() || undefined,
-          }),
-        });
-        setNotice(`Akun guru "${fullName.trim()}" berhasil diperbarui dan disinkronkan.`);
+        const res = await apiFetch<{ teacher: TeacherListItem }>(
+          `/api/admin/teachers/${editingTeacher.id}`,
+          {
+            method: 'PUT',
+            body: JSON.stringify({
+              nip: trimmedNip,
+              fullName: trimmedName,
+              subject: trimmedSubject,
+              isActive,
+              password: trimmedPassword || undefined,
+            }),
+          }
+        );
+        if (!res?.teacher?.id) {
+          throw new Error('Respon server tidak valid saat memperbarui akun guru.');
+        }
+        await loadTeachers();
+        setModalOpen(false);
+        setNotice(`Akun guru "${res.teacher.fullName}" berhasil diperbarui dan disinkronkan.`);
       } else {
-        await apiFetch('/api/admin/teachers', {
+        const res = await apiFetch<{ teacher: TeacherListItem }>('/api/admin/teachers', {
           method: 'POST',
           body: JSON.stringify({
-            nip: nip.trim(),
-            fullName: fullName.trim(),
-            subject: subject.trim(),
-            password: password.trim(),
+            nip: trimmedNip,
+            fullName: trimmedName,
+            subject: trimmedSubject,
+            password: trimmedPassword,
             isActive,
           }),
         });
-        setNotice(`Akun guru "${fullName.trim()}" (${nip.trim()}) berhasil ditambahkan.`);
+        if (!res?.teacher?.id) {
+          throw new Error('Respon server tidak valid saat menambahkan akun guru.');
+        }
+        setTeachers((prev) => [...prev, res.teacher]);
+        setModalOpen(false);
+        setNotice(`Akun guru "${res.teacher.fullName}" (${res.teacher.nip}) berhasil ditambahkan.`);
       }
-      setModalOpen(false);
-      loadTeachers();
     } catch (err) {
       setModalError(err instanceof Error ? err.message : 'Gagal menyimpan akun guru.');
     } finally {
@@ -178,6 +195,9 @@ export const TeachersManager: React.FC = () => {
         method: 'POST',
         body: JSON.stringify({ teachers: valid }),
       });
+      if (!res || !Array.isArray(res.teachers)) {
+        throw new Error('Respon server tidak valid saat mengunggah data guru.');
+      }
       setTeachers(res.teachers);
       const invalidCount = parsed.length - valid.length + (res.skipped || 0);
       setNotice(
@@ -508,8 +528,9 @@ export const TeachersManager: React.FC = () => {
               <div className="flex justify-end gap-2.5 pt-2">
                 <button
                   type="button"
+                  disabled={saving}
                   onClick={() => setModalOpen(false)}
-                  className="px-4 py-2 rounded-lg border border-slate-300 text-sm font-semibold text-slate-700"
+                  className="px-4 py-2 rounded-lg border border-slate-300 disabled:opacity-50 text-sm font-semibold text-slate-700"
                 >
                   Batal
                 </button>

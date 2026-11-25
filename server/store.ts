@@ -1115,6 +1115,9 @@ class StoreManager {
       nextVersion = await dbFlushChanges(upserts, deletes, events);
     } catch (err) {
       ctx.events.unshift(...events);
+      if (cacheTarget && this.cache === cacheTarget) {
+        this.cache = null;
+      }
       throw err;
     }
 

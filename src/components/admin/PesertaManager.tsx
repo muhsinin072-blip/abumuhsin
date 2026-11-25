@@ -25,6 +25,8 @@ export const PesertaManager: React.FC<PesertaManagerProps> = ({ settings }) => {
   const [room, setRoom] = useState('LAB-01');
   const [sessionGroup, setSessionGroup] = useState('Sesi 1');
   const [password, setPassword] = useState('123');
+  const [saving, setSaving] = useState(false);
+  const [importing, setImporting] = useState(false);
   const [modalError, setModalError] = useState('');
 
   const [purgeModalOpen, setPurgeModalOpen] = useState(false);
@@ -169,18 +171,32 @@ export const PesertaManager: React.FC<PesertaManagerProps> = ({ settings }) => {
   const handleAddStudent = async (e: React.FormEvent) => {
     e.preventDefault();
     setModalError('');
+    setNotice('');
+    setSaving(true);
     try {
       const res = await apiFetch<{ student: Student }>('/api/admin/students', {
         method: 'POST',
-        body: JSON.stringify({ nis, name, className, room, sessionGroup, password }),
+        body: JSON.stringify({
+          nis: nis.trim(),
+          name: name.trim(),
+          className: className.trim(),
+          room: room.trim(),
+          sessionGroup: sessionGroup.trim(),
+          password: password.trim(),
+        }),
       });
+      if (!res?.student?.id) {
+        throw new Error('Respon server tidak valid saat menyimpan peserta.');
+      }
       setStudents((prev) => [...prev, res.student]);
       setModalOpen(false);
       setNis('');
       setName('');
-      setNotice(`Peserta ${res.student.name} berhasil ditambahkan.`);
+      setNotice(`Peserta ${res.student.name} (${res.student.nis}) berhasil ditambahkan ke server.`);
     } catch (err) {
       setModalError(err instanceof Error ? err.message : 'Gagal menambah peserta.');
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -222,11 +238,18 @@ export const PesertaManager: React.FC<PesertaManagerProps> = ({ settings }) => {
     e.target.value = '';
     if (!file) return;
     setError('');
+    setNotice('');
+    setImporting(true);
     try {
       const parsed = await parseStudentExcel(file);
       const valid = parsed.filter((r) => r.issues.length === 0);
       if (valid.length === 0) {
-        setError('Tidak ada baris peserta valid pada file Excel (pastikan kolom NIS dan Nama terisi).');
+        const firstIssue = parsed[0]?.issues.join(', ');
+        setError(
+          firstIssue
+            ? `Tidak ada baris peserta valid pada file (${firstIssue}).`
+            : 'Tidak ada baris peserta valid pada file Excel (pastikan kolom NIS dan Nama terisi).'
+        );
         return;
       }
       const res = await apiFetch<{ added: number; updated: number; students: Student[] }>(
@@ -236,10 +259,20 @@ export const PesertaManager: React.FC<PesertaManagerProps> = ({ settings }) => {
           body: JSON.stringify({ students: valid }),
         }
       );
+      if (!res || !Array.isArray(res.students)) {
+        throw new Error('Respon server tidak valid saat mengimpor data peserta.');
+      }
       setStudents(res.students);
-      setNotice(`Import Excel selesai: ${res.added} peserta baru, ${res.updated} diperbarui.`);
+      const invalidCount = parsed.length - valid.length;
+      setNotice(
+        `Import Excel selesai: ${res.added} peserta baru, ${res.updated} diperbarui${
+          invalidCount > 0 ? `, ${invalidCount} baris dilewati` : ''
+        }.`
+      );
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Gagal mengimpor file Excel peserta.');
+    } finally {
+      setImporting(false);
     }
   };
 
@@ -262,10 +295,20 @@ export const PesertaManager: React.FC<PesertaManagerProps> = ({ settings }) => {
             <Download className="w-4 h-4" />
             Template Peserta
           </button>
-          <label className="inline-flex items-center gap-2 px-3.5 py-2 rounded-lg border border-teal-700 bg-teal-50 hover:bg-teal-100 text-teal-800 text-sm font-semibold cursor-pointer whitespace-nowrap">
+          <label
+            className={`inline-flex items-center gap-2 px-3.5 py-2 rounded-lg border border-teal-700 bg-teal-50 hover:bg-teal-100 text-teal-800 text-sm font-semibold whitespace-nowrap ${
+              importing ? 'opacity-60 cursor-wait' : 'cursor-pointer'
+            }`}
+          >
             <Upload className="w-4 h-4" />
-            Import Excel
-            <input type="file" accept=".xlsx,.xls,.csv" onChange={handleImportExcel} className="hidden" />
+            {importing ? 'Mengunggah...' : 'Import Excel'}
+            <input
+              type="file"
+              accept=".xlsx,.xls,.csv"
+              disabled={importing}
+              onChange={handleImportExcel}
+              className="hidden"
+            />
           </label>
           <button
             type="button"
@@ -499,16 +542,18 @@ export const PesertaManager: React.FC<PesertaManagerProps> = ({ settings }) => {
               <div className="flex justify-end gap-2.5 pt-2">
                 <button
                   type="button"
+                  disabled={saving}
                   onClick={() => setModalOpen(false)}
-                  className="px-4 py-2 rounded-lg border border-slate-300 text-sm font-semibold text-slate-700"
+                  className="px-4 py-2 rounded-lg border border-slate-300 disabled:opacity-50 text-sm font-semibold text-slate-700"
                 >
                   Batal
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2 rounded-lg bg-teal-700 hover:bg-teal-800 text-white text-sm font-semibold"
+                  disabled={saving}
+                  className="px-4 py-2 rounded-lg bg-teal-700 hover:bg-teal-800 disabled:bg-slate-400 text-white text-sm font-semibold"
                 >
-                  Simpan Peserta
+                  {saving ? 'Menyimpan...' : 'Simpan Peserta'}
                 </button>
               </div>
             </form>

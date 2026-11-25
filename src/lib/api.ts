@@ -133,7 +133,8 @@ function delayMs(ms: number): Promise<void> {
 
 export async function apiFetch<T>(url: string, options: RequestInit = {}): Promise<T> {
   const method = (options.method || 'GET').toUpperCase();
-  const maxAttempts = method === 'GET' || method === 'HEAD' ? 4 : 3;
+  const isReadMethod = method === 'GET' || method === 'HEAD';
+  const maxAttempts = isReadMethod ? 4 : 2;
   let lastError: Error | null = null;
   let verifiedSessionAfter401 = false;
 
@@ -184,7 +185,10 @@ export async function apiFetch<T>(url: string, options: RequestInit = {}): Promi
             }
             throw new Error(errMsg);
           }
-          const shouldRetry = data?.retryable !== false && TRANSIENT_HTTP_STATUS.has(res.status);
+          const canRetryStatus = isReadMethod
+            ? TRANSIENT_HTTP_STATUS.has(res.status)
+            : res.status === 503;
+          const shouldRetry = data?.retryable !== false && canRetryStatus;
           if (attempt < maxAttempts - 1 && shouldRetry) {
             lastError = new Error(errMsg);
             await delayMs(250 * (attempt + 1) + Math.floor(Math.random() * 200));
@@ -220,17 +224,20 @@ export async function apiFetch<T>(url: string, options: RequestInit = {}): Promi
           }
           throw new Error(errMsg);
         }
-        if (attempt < maxAttempts - 1 && TRANSIENT_HTTP_STATUS.has(res.status)) {
+        if (attempt < maxAttempts - 1 && isReadMethod && TRANSIENT_HTTP_STATUS.has(res.status)) {
           lastError = new Error(errMsg);
           await delayMs(250 * (attempt + 1) + Math.floor(Math.random() * 200));
           continue;
         }
         throw new Error(errMsg);
       }
-      return (await res.text()) as unknown as T;
+
+      throw new Error(
+        `Respon server tidak valid (${res.status}, bukan JSON). Pastikan endpoint API backend aktif.`
+      );
     } catch (err) {
       const isNetworkErr = err instanceof TypeError;
-      if (attempt < maxAttempts - 1 && isNetworkErr) {
+      if (attempt < maxAttempts - 1 && isReadMethod && isNetworkErr) {
         lastError = err;
         await delayMs(250 * (attempt + 1) + Math.floor(Math.random() * 200));
         continue;

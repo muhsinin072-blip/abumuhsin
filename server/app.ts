@@ -50,6 +50,41 @@ interface AuthenticatedRequest extends Request {
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
+// Log all mutating API requests and error responses clearly so Vercel Function Logs
+// always shows POST/PUT/DELETE operations when users save data.
+app.use('/api', (req: Request, res: Response, next: NextFunction) => {
+  const startedAt = Date.now();
+  const method = req.method.toUpperCase();
+  const origUrl = req.originalUrl || req.url;
+
+  if (method !== 'GET' && method !== 'HEAD') {
+    console.log(`[API] -> ${method} ${origUrl}`);
+  }
+  res.on('finish', () => {
+    if ((method !== 'GET' && method !== 'HEAD') || res.statusCode >= 400) {
+      console.log(`[API] <- ${method} ${origUrl} (${res.statusCode}) ${Date.now() - startedAt}ms`);
+    }
+  });
+
+  // Support clean REST aliases (/api/teachers, /api/students, /api/banks)
+  // alongside /api/admin/* endpoints.
+  if (
+    req.url === '/teachers' ||
+    req.url.startsWith('/teachers/') ||
+    req.url.startsWith('/teachers?') ||
+    req.url === '/students' ||
+    req.url.startsWith('/students/') ||
+    req.url.startsWith('/students?') ||
+    req.url === '/banks' ||
+    req.url.startsWith('/banks/') ||
+    req.url.startsWith('/banks?')
+  ) {
+    req.url = `/admin${req.url}`;
+  }
+
+  next();
+});
+
 const STAFF_AUDIENCE = 'staff';
 const STUDENTS_AUDIENCE = 'students';
 const ONLINE_TIMEOUT_MS = 35_000;
@@ -2035,6 +2070,124 @@ app.post('/api/admin/banks/:id/import', requireAuth, requireStaff, (req: Authent
   res.json({ importedCount: sanitized.length, bank });
 });
 
+// Alias endpoints: POST /api/questions and POST /api/questions/import (accepts bankId in body/query)
+app.post('/api/questions', requireAuth, requireStaff, (req: AuthenticatedRequest, res) => {
+  const db = store.getDb();
+  const body = req.body || {};
+  const bankId =
+    (typeof body.bankId === 'string' && body.bankId.trim()) ||
+    (typeof req.query.bankId === 'string' && req.query.bankId.trim()) ||
+    '';
+  const bank = db.banks.find((b) => b.id === bankId);
+  if (!bank) {
+    res.status(404).json({ error: 'Bank soal tidak ditemukan. Sertakan bankId yang valid.' });
+    return;
+  }
+  if (isGuruUser(req.user) && !isBankOwnedByTeacher(bank, req.user!)) {
+    res.status(403).json({ error: 'Akses ditolak untuk Bank Soal guru lain.' });
+    return;
+  }
+  const text = typeof body.text === 'string' ? body.text.trim() : '';
+  if (!text) {
+    res.status(400).json({ error: 'Teks pertanyaan wajib diisi.' });
+    return;
+  }
+  const qType = body.type === 'ESAI' ? 'ESAI' : 'PG';
+  const validAnswers = ['A', 'B', 'C', 'D', 'E'];
+  const correct =
+    qType === 'PG' && validAnswers.includes(String(body.correctAnswer).toUpperCase())
+      ? (String(body.correctAnswer).toUpperCase() as 'A' | 'B' | 'C' | 'D' | 'E')
+      : '';
+
+  const question: Question = {
+    id: `q-${crypto.randomUUID()}`,
+    number: bank.questions.length + 1,
+    type: qType,
+    text,
+    optionA: typeof body.optionA === 'string' ? body.optionA.trim() : '',
+    optionB: typeof body.optionB === 'string' ? body.optionB.trim() : '',
+    optionC: typeof body.optionC === 'string' ? body.optionC.trim() : '',
+    optionD: typeof body.optionD === 'string' ? body.optionD.trim() : '',
+    optionE: typeof body.optionE === 'string' ? body.optionE.trim() : '',
+    correctAnswer: correct,
+    weight: typeof body.weight === 'number' && body.weight > 0 ? body.weight : 10,
+  };
+  bank.questions.push(question);
+  bank.updatedAt = new Date().toISOString();
+  store.commit();
+  sendToAdmins('sync:banks', { action: 'question_added', bankId: bank.id });
+  res.status(201).json({ question, bank });
+});
+
+app.post('/api/questions/import', requireAuth, requireStaff, (req: AuthenticatedRequest, res) => {
+  const db = store.getDb();
+  const body = req.body || {};
+  const bankId =
+    (typeof body.bankId === 'string' && body.bankId.trim()) ||
+    (typeof req.query.bankId === 'string' && req.query.bankId.trim()) ||
+    '';
+  const bank = db.banks.find((b) => b.id === bankId);
+  if (!bank) {
+    res.status(404).json({ error: 'Bank soal tidak ditemukan. Sertakan bankId yang valid.' });
+    return;
+  }
+  if (isGuruUser(req.user) && !isBankOwnedByTeacher(bank, req.user!)) {
+    res.status(403).json({ error: 'Akses ditolak untuk Bank Soal guru lain.' });
+    return;
+  }
+  const incoming = Array.isArray(body.questions) ? body.questions : [];
+  const replaceExisting = Boolean(body.replaceExisting);
+  if (incoming.length === 0) {
+    res.status(400).json({ error: 'Tidak ada data soal valid untuk diimpor.' });
+    return;
+  }
+  const validAnswers = ['A', 'B', 'C', 'D', 'E'];
+  const sanitized: Question[] = [];
+  const startNumber = replaceExisting ? 1 : bank.questions.length + 1;
+  incoming.forEach((raw: Record<string, unknown>, idx: number) => {
+    const text = typeof raw.text === 'string' ? raw.text.trim() : '';
+    if (!text) return;
+    const rawType = typeof raw.type === 'string' ? raw.type.trim().toUpperCase() : 'PG';
+    const type = rawType === 'ESAI' || rawType === 'ESSAY' ? 'ESAI' : 'PG';
+    const rawCorrect = typeof raw.correctAnswer === 'string' ? raw.correctAnswer.trim().toUpperCase() : '';
+    const correctAnswer =
+      type === 'PG' && validAnswers.includes(rawCorrect)
+        ? (rawCorrect as 'A' | 'B' | 'C' | 'D' | 'E')
+        : '';
+
+    sanitized.push({
+      id: `q-${crypto.randomUUID()}`,
+      number: startNumber + idx,
+      type,
+      text,
+      optionA: typeof raw.optionA === 'string' ? raw.optionA.trim() : '',
+      optionB: typeof raw.optionB === 'string' ? raw.optionB.trim() : '',
+      optionC: typeof raw.optionC === 'string' ? raw.optionC.trim() : '',
+      optionD: typeof raw.optionD === 'string' ? raw.optionD.trim() : '',
+      optionE: typeof raw.optionE === 'string' ? raw.optionE.trim() : '',
+      correctAnswer,
+      weight: typeof raw.weight === 'number' && raw.weight > 0 ? raw.weight : 10,
+    });
+  });
+
+  if (sanitized.length === 0) {
+    res.status(400).json({ error: 'Tidak ada data soal valid untuk diimpor.' });
+    return;
+  }
+
+  if (replaceExisting) {
+    bank.questions = sanitized;
+  } else {
+    bank.questions.push(...sanitized);
+  }
+  bank.questions = bank.questions.map((q, idx) => ({ ...q, number: idx + 1 }));
+  bank.updatedAt = new Date().toISOString();
+  store.commit();
+  sendToAdmins('sync:banks', { action: 'imported', bankId: bank.id });
+
+  res.json({ importedCount: sanitized.length, bank });
+});
+
 // Peserta CRUD & Excel Import
 app.get('/api/admin/students', requireAuth, requireStaff, (_req, res) => {
   res.json({ students: store.getDb().students });
@@ -3104,6 +3257,41 @@ app.post('/api/events', requireAuth, (req: AuthenticatedRequest, res) => {
     }
   }
   res.json({ ok: true });
+});
+
+app.use('/api', (req: Request, res: Response) => {
+  res.status(404).json({
+    error: `Endpoint API tidak ditemukan: ${req.method} ${req.originalUrl || req.url}`,
+  });
+});
+
+app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
+  const errObj = err as { status?: number; statusCode?: number; type?: string; message?: string };
+  const statusCode =
+    typeof errObj?.statusCode === 'number'
+      ? errObj.statusCode
+      : typeof errObj?.status === 'number'
+        ? errObj.status
+        : 500;
+  console.error(`[API ERROR] ${req.method} ${req.originalUrl || req.url}:`, err);
+  if (res.headersSent) {
+    return;
+  }
+  if (errObj?.type === 'entity.too.large' || statusCode === 413) {
+    res.status(413).json({
+      error: 'Ukuran data yang dikirim melebihi batas maksimal server (10 MB).',
+    });
+    return;
+  }
+  if (errObj?.type === 'entity.parse.failed') {
+    res.status(400).json({
+      error: 'Format JSON permintaan tidak valid.',
+    });
+    return;
+  }
+  res.status(statusCode >= 400 ? statusCode : 500).json({
+    error: errObj?.message || 'Terjadi kesalahan internal pada server.',
+  });
 });
 
 export { app };

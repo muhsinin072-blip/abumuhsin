@@ -21,6 +21,7 @@ export const JadwalUjianManager: React.FC = () => {
   const [showScoreAfterFinish, setShowScoreAfterFinish] = useState(true);
   const [antiCheatEnabled, setAntiCheatEnabled] = useState(true);
   const [maxViolations, setMaxViolations] = useState(3);
+  const [saving, setSaving] = useState(false);
   const [modalError, setModalError] = useState('');
 
   const loadData = useCallback(async () => {
@@ -65,10 +66,12 @@ export const JadwalUjianManager: React.FC = () => {
   const handleCreateExam = async (e: React.FormEvent) => {
     e.preventDefault();
     setModalError('');
+    setNotice('');
     if (!bankId) {
       setModalError('Pilih Bank Soal terlebih dahulu sebelum menyimpan jadwal.');
       return;
     }
+    setSaving(true);
     try {
       const targetClasses = classesText
         .split(',')
@@ -77,7 +80,7 @@ export const JadwalUjianManager: React.FC = () => {
       const res = await apiFetch<{ exam: ExamSchedule }>('/api/admin/exams', {
         method: 'POST',
         body: JSON.stringify({
-          title,
+          title: title.trim(),
           bankId,
           targetClasses,
           durationMinutes: Number(durationMinutes),
@@ -88,12 +91,17 @@ export const JadwalUjianManager: React.FC = () => {
           maxViolations: Number(maxViolations),
         }),
       });
+      if (!res?.exam?.id) {
+        throw new Error('Respon server tidak valid saat menyimpan jadwal ujian.');
+      }
       setExams((prev) => [res.exam, ...prev]);
       setModalOpen(false);
       setTitle('');
       setNotice(`Jadwal ujian "${res.exam.title}" dibuat dengan Token ${res.exam.token}.`);
     } catch (err) {
       setModalError(err instanceof Error ? err.message : 'Gagal membuat jadwal ujian.');
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -370,17 +378,18 @@ export const JadwalUjianManager: React.FC = () => {
               <div className="flex justify-end gap-2.5 pt-3">
                 <button
                   type="button"
+                  disabled={saving}
                   onClick={() => setModalOpen(false)}
-                  className="px-4 py-2 rounded-lg border border-slate-300 text-sm font-semibold text-slate-700"
+                  className="px-4 py-2 rounded-lg border border-slate-300 disabled:opacity-50 text-sm font-semibold text-slate-700"
                 >
                   Batal
                 </button>
                 <button
                   type="submit"
-                  disabled={banks.length === 0}
+                  disabled={saving || banks.length === 0}
                   className="px-4 py-2 rounded-lg bg-teal-700 hover:bg-teal-800 disabled:bg-slate-300 text-white text-sm font-semibold"
                 >
-                  Simpan & Terbitkan Token
+                  {saving ? 'Menyimpan...' : 'Simpan & Terbitkan Token'}
                 </button>
               </div>
             </form>

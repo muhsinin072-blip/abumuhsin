@@ -42,6 +42,7 @@ export const BankSoalManager: React.FC<BankSoalManagerProps> = ({
   const [bankTeacher, setBankTeacher] = useState(teacherNameDefault);
   const [bankKkm, setBankKkm] = useState(75);
   const [bankPgWeight, setBankPgWeight] = useState(80);
+  const [savingBank, setSavingBank] = useState(false);
   const [bankModalError, setBankModalError] = useState('');
 
   // Add/Edit Question Modal
@@ -56,6 +57,7 @@ export const BankSoalManager: React.FC<BankSoalManagerProps> = ({
   const [qOptE, setQOptE] = useState('');
   const [qCorrect, setQCorrect] = useState<'A' | 'B' | 'C' | 'D' | 'E'>('A');
   const [qWeight, setQWeight] = useState(10);
+  const [savingQuestion, setSavingQuestion] = useState(false);
   const [qModalError, setQModalError] = useState('');
 
   // Excel & Word Import Preview Modal
@@ -112,22 +114,27 @@ export const BankSoalManager: React.FC<BankSoalManagerProps> = ({
   const handleCreateBank = async (e: React.FormEvent) => {
     e.preventDefault();
     setBankModalError('');
+    setNotice('');
+    setSavingBank(true);
     const clampedKkm = Math.min(100, Math.max(0, Number(bankKkm) || 0));
     const clampedPg = Math.min(100, Math.max(0, Number(bankPgWeight) || 0));
     try {
       const res = await apiFetch<{ bank: QuestionBank }>('/api/admin/banks', {
         method: 'POST',
         body: JSON.stringify({
-          code: bankCode,
-          subject: bankSubject,
-          gradeLevel: bankGrade,
+          code: bankCode.trim(),
+          subject: bankSubject.trim(),
+          gradeLevel: bankGrade.trim(),
           teacherId: !isGuru && bankTeacherId ? bankTeacherId : undefined,
-          teacherName: isGuru ? teacherNameDefault : bankTeacher,
+          teacherName: (isGuru ? teacherNameDefault : bankTeacher).trim(),
           kkm: clampedKkm,
           pgWeightPercent: clampedPg,
           essayWeightPercent: 100 - clampedPg,
         }),
       });
+      if (!res?.bank?.id) {
+        throw new Error('Respon server tidak valid saat membuat bank soal.');
+      }
       setBanks((prev) => [...prev, res.bank]);
       setSelectedBankId(res.bank.id);
       setBankModalOpen(false);
@@ -138,6 +145,8 @@ export const BankSoalManager: React.FC<BankSoalManagerProps> = ({
       setNotice(`Bank soal ${res.bank.code} berhasil dibuat.`);
     } catch (err) {
       setBankModalError(err instanceof Error ? err.message : 'Gagal membuat bank soal.');
+    } finally {
+      setSavingBank(false);
     }
   };
 
@@ -183,17 +192,22 @@ export const BankSoalManager: React.FC<BankSoalManagerProps> = ({
 
   const handleSaveQuestion = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!selectedBank) return;
+    if (!selectedBank) {
+      setQModalError('Bank soal target belum dipilih.');
+      return;
+    }
     setQModalError('');
+    setNotice('');
+    setSavingQuestion(true);
     try {
       const payload = {
         type: qType,
-        text: qText,
-        optionA: qOptA,
-        optionB: qOptB,
-        optionC: qOptC,
-        optionD: qOptD,
-        optionE: qOptE,
+        text: qText.trim(),
+        optionA: qOptA.trim(),
+        optionB: qOptB.trim(),
+        optionC: qOptC.trim(),
+        optionD: qOptD.trim(),
+        optionE: qOptE.trim(),
         correctAnswer: qType === 'PG' ? qCorrect : '',
         weight: Math.max(1, Number(qWeight) || 1),
       };
@@ -202,15 +216,23 @@ export const BankSoalManager: React.FC<BankSoalManagerProps> = ({
             `/api/admin/banks/${selectedBank.id}/questions/${editingQ.id}`,
             { method: 'PUT', body: JSON.stringify(payload) }
           )
-        : await apiFetch<{ bank: QuestionBank }>(`/api/admin/banks/${selectedBank.id}/questions`, {
-            method: 'POST',
-            body: JSON.stringify(payload),
-          });
+        : await apiFetch<{ question?: Question; bank: QuestionBank }>(
+            `/api/admin/banks/${selectedBank.id}/questions`,
+            {
+              method: 'POST',
+              body: JSON.stringify(payload),
+            }
+          );
+      if (!res?.bank?.id) {
+        throw new Error('Respon server tidak valid saat menyimpan soal.');
+      }
       setBanks((prev) => prev.map((b) => (b.id === res.bank.id ? res.bank : b)));
       setQModalOpen(false);
       setNotice(editingQ ? 'Butir soal berhasil diperbarui.' : 'Butir soal baru berhasil ditambahkan.');
     } catch (err) {
       setQModalError(err instanceof Error ? err.message : 'Gagal menyimpan soal.');
+    } finally {
+      setSavingQuestion(false);
     }
   };
 
@@ -233,8 +255,13 @@ export const BankSoalManager: React.FC<BankSoalManagerProps> = ({
     if (!file) return;
     setError('');
     setImportModalError('');
+    setReplaceExisting(false);
     try {
       const parsed = await parseQuestionExcel(file);
+      if (parsed.length === 0) {
+        setError('Tidak ada soal yang terbaca dari file Excel/CSV tersebut.');
+        return;
+      }
       setImportSource('Excel');
       setImportPreview(parsed);
     } catch (err) {
@@ -248,8 +275,13 @@ export const BankSoalManager: React.FC<BankSoalManagerProps> = ({
     if (!file) return;
     setError('');
     setImportModalError('');
+    setReplaceExisting(false);
     try {
       const parsed = await parseQuestionWord(file);
+      if (parsed.length === 0) {
+        setError('Tidak ada soal yang terbaca dari file Word tersebut.');
+        return;
+      }
       setImportSource('Word');
       setImportPreview(parsed);
     } catch (err) {
@@ -265,6 +297,7 @@ export const BankSoalManager: React.FC<BankSoalManagerProps> = ({
       return;
     }
     setImportModalError('');
+    setNotice('');
     setImporting(true);
     try {
       const res = await apiFetch<{ importedCount: number; bank: QuestionBank }>(
@@ -277,6 +310,9 @@ export const BankSoalManager: React.FC<BankSoalManagerProps> = ({
           }),
         }
       );
+      if (!res?.bank?.id) {
+        throw new Error('Respon server tidak valid saat mengimpor soal.');
+      }
       setBanks((prev) => prev.map((b) => (b.id === res.bank.id ? res.bank : b)));
       setImportPreview(null);
       setNotice(
@@ -743,16 +779,18 @@ export const BankSoalManager: React.FC<BankSoalManagerProps> = ({
               <div className="flex justify-end gap-2.5 pt-2">
                 <button
                   type="button"
+                  disabled={savingBank}
                   onClick={() => setBankModalOpen(false)}
-                  className="px-4 py-2 rounded-lg border border-slate-300 text-sm font-semibold text-slate-700"
+                  className="px-4 py-2 rounded-lg border border-slate-300 disabled:opacity-50 text-sm font-semibold text-slate-700"
                 >
                   Batal
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2 rounded-lg bg-teal-700 hover:bg-teal-800 text-white text-sm font-semibold"
+                  disabled={savingBank}
+                  className="px-4 py-2 rounded-lg bg-teal-700 hover:bg-teal-800 disabled:bg-slate-400 text-white text-sm font-semibold"
                 >
-                  Simpan Bank Soal
+                  {savingBank ? 'Menyimpan...' : 'Simpan Bank Soal'}
                 </button>
               </div>
             </form>
@@ -875,16 +913,18 @@ export const BankSoalManager: React.FC<BankSoalManagerProps> = ({
               <div className="flex justify-end gap-2.5 pt-2">
                 <button
                   type="button"
+                  disabled={savingQuestion}
                   onClick={() => setQModalOpen(false)}
-                  className="px-4 py-2 rounded-lg border border-slate-300 text-sm font-semibold text-slate-700"
+                  className="px-4 py-2 rounded-lg border border-slate-300 disabled:opacity-50 text-sm font-semibold text-slate-700"
                 >
                   Batal
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2 rounded-lg bg-teal-700 hover:bg-teal-800 text-white text-sm font-semibold"
+                  disabled={savingQuestion}
+                  className="px-4 py-2 rounded-lg bg-teal-700 hover:bg-teal-800 disabled:bg-slate-400 text-white text-sm font-semibold"
                 >
-                  Simpan Soal
+                  {savingQuestion ? 'Menyimpan...' : 'Simpan Soal'}
                 </button>
               </div>
             </form>
@@ -964,8 +1004,9 @@ export const BankSoalManager: React.FC<BankSoalManagerProps> = ({
               <div className="flex items-center gap-3">
                 <button
                   type="button"
+                  disabled={importing}
                   onClick={() => setImportPreview(null)}
-                  className="px-4 py-2 rounded-lg border border-slate-300 text-sm font-semibold text-slate-700 bg-white"
+                  className="px-4 py-2 rounded-lg border border-slate-300 disabled:opacity-50 text-sm font-semibold text-slate-700 bg-white"
                 >
                   Batal
                 </button>
@@ -973,7 +1014,7 @@ export const BankSoalManager: React.FC<BankSoalManagerProps> = ({
                   type="button"
                   disabled={importing}
                   onClick={handleConfirmImport}
-                  className="px-4 py-2 rounded-lg bg-teal-700 hover:bg-teal-800 text-white text-sm font-semibold"
+                  className="px-4 py-2 rounded-lg bg-teal-700 hover:bg-teal-800 disabled:bg-slate-400 text-white text-sm font-semibold"
                 >
                   {importing ? 'Mengimpor...' : 'Simpan ke Bank Soal'}
                 </button>
