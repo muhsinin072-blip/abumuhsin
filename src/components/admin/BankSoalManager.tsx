@@ -73,8 +73,8 @@ export const BankSoalManager: React.FC<BankSoalManagerProps> = ({
   const [clearing, setClearing] = useState(false);
   const [clearError, setClearError] = useState('');
 
-  const loadBanks = useCallback(async () => {
-    setLoading(true);
+  const loadBanks = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
     try {
       const [data, tRes] = await Promise.all([
         apiFetch<BanksResponse>('/api/admin/banks'),
@@ -93,9 +93,11 @@ export const BankSoalManager: React.FC<BankSoalManagerProps> = ({
         setSelectedBankId('');
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Gagal memuat bank soal.');
+      if (!silent) {
+        setError(err instanceof Error ? err.message : 'Gagal memuat bank soal.');
+      }
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }, [isGuru]);
 
@@ -103,7 +105,7 @@ export const BankSoalManager: React.FC<BankSoalManagerProps> = ({
     loadBanks();
     const ws = createCbtWebSocket((event) => {
       if (event === 'sync:banks' || event === 'sync:teachers') {
-        loadBanks();
+        loadBanks(true);
       }
     });
     return () => ws.close();

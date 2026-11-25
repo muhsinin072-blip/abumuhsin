@@ -96,8 +96,10 @@ export const PembelajaranManager: React.FC<PembelajaranManagerProps> = ({
 
   const [previewItem, setPreviewItem] = useState<LearningMaterial | null>(null);
 
-  const loadMaterials = useCallback(async () => {
-    setLoading(true);
+  const loadMaterials = useCallback(async (silent = false) => {
+    if (!silent) {
+      setLoading(true);
+    }
     try {
       const res = await apiFetch<MaterialsResponse>('/api/admin/materials');
       setMaterials(res.materials);
@@ -106,7 +108,9 @@ export const PembelajaranManager: React.FC<PembelajaranManagerProps> = ({
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Gagal memuat materi pembelajaran.');
     } finally {
-      setLoading(false);
+      if (!silent) {
+        setLoading(false);
+      }
     }
   }, []);
 
@@ -114,7 +118,7 @@ export const PembelajaranManager: React.FC<PembelajaranManagerProps> = ({
     loadMaterials();
     const ws = createCbtWebSocket((event) => {
       if (event === 'sync:materials' || event === 'sync:students' || event === 'sync:teachers') {
-        loadMaterials();
+        loadMaterials(true);
       }
     });
     return () => ws.close();
@@ -202,20 +206,27 @@ export const PembelajaranManager: React.FC<PembelajaranManagerProps> = ({
         teacherName: teacherNameDefault || undefined,
       };
       if (editing) {
-        await apiFetch(`/api/admin/materials/${editing.id}`, {
+        const res = await apiFetch<{ material: LearningMaterial }>(`/api/admin/materials/${editing.id}`, {
           method: 'PUT',
           body: JSON.stringify(payload),
         });
-        setNotice(`Materi "${title.trim()}" berhasil diperbarui.`);
+        if (!res?.material?.id) {
+          throw new Error('Respon server tidak valid saat memperbarui materi.');
+        }
+        setMaterials((prev) => prev.map((m) => (m.id === res.material.id ? res.material : m)));
+        setNotice(`Materi "${res.material.title}" berhasil diperbarui.`);
       } else {
-        await apiFetch('/api/admin/materials', {
+        const res = await apiFetch<{ material: LearningMaterial }>('/api/admin/materials', {
           method: 'POST',
           body: JSON.stringify(payload),
         });
-        setNotice(`Materi "${title.trim()}" berhasil ditambahkan.`);
+        if (!res?.material?.id) {
+          throw new Error('Respon server tidak valid saat menambahkan materi.');
+        }
+        setMaterials((prev) => [res.material, ...prev]);
+        setNotice(`Materi "${res.material.title}" berhasil ditambahkan.`);
       }
       setModalOpen(false);
-      await loadMaterials();
     } catch (err) {
       setModalError(err instanceof Error ? err.message : 'Gagal menyimpan materi pembelajaran.');
     } finally {
@@ -226,16 +237,18 @@ export const PembelajaranManager: React.FC<PembelajaranManagerProps> = ({
   const handleTogglePublish = async (item: LearningMaterial) => {
     setError('');
     try {
-      await apiFetch(`/api/admin/materials/${item.id}`, {
+      const res = await apiFetch<{ material: LearningMaterial }>(`/api/admin/materials/${item.id}`, {
         method: 'PUT',
         body: JSON.stringify({ isPublished: !item.isPublished }),
       });
+      if (res?.material?.id) {
+        setMaterials((prev) => prev.map((m) => (m.id === res.material.id ? res.material : m)));
+      }
       setNotice(
         !item.isPublished
           ? `Materi "${item.title}" diterbitkan ke portal siswa.`
           : `Materi "${item.title}" dikembalikan ke Draf.`
       );
-      await loadMaterials();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Gagal mengubah status publikasi.');
     }
@@ -245,8 +258,8 @@ export const PembelajaranManager: React.FC<PembelajaranManagerProps> = ({
     setError('');
     try {
       await apiFetch(`/api/admin/materials/${item.id}`, { method: 'DELETE' });
+      setMaterials((prev) => prev.filter((m) => m.id !== item.id));
       setNotice(`Materi "${item.title}" berhasil dihapus.`);
-      await loadMaterials();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Gagal menghapus materi pembelajaran.');
     }

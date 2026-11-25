@@ -38,8 +38,10 @@ export const TeachersManager: React.FC = () => {
   const [purging, setPurging] = useState(false);
   const [purgeError, setPurgeError] = useState('');
 
-  const loadTeachers = useCallback(async () => {
-    setLoading(true);
+  const loadTeachers = useCallback(async (silent = false) => {
+    if (!silent) {
+      setLoading(true);
+    }
     try {
       const res = await apiFetch<TeachersResponse>('/api/admin/teachers');
       setTeachers(res.teachers);
@@ -47,7 +49,9 @@ export const TeachersManager: React.FC = () => {
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Gagal memuat daftar guru.');
     } finally {
-      setLoading(false);
+      if (!silent) {
+        setLoading(false);
+      }
     }
   }, []);
 
@@ -55,7 +59,7 @@ export const TeachersManager: React.FC = () => {
     loadTeachers();
     const ws = createCbtWebSocket((event) => {
       if (event === 'sync:teachers' || event === 'sync:banks' || event === 'sync:exams') {
-        loadTeachers();
+        loadTeachers(true);
       }
     });
     return () => ws.close();
@@ -110,7 +114,13 @@ export const TeachersManager: React.FC = () => {
         if (!res?.teacher?.id) {
           throw new Error('Respon server tidak valid saat memperbarui akun guru.');
         }
-        await loadTeachers();
+        setTeachers((prev) =>
+          prev.map((t) =>
+            t.id === res.teacher.id
+              ? { ...t, ...res.teacher, banksCount: t.banksCount, examsCount: t.examsCount }
+              : t
+          )
+        );
         setModalOpen(false);
         setNotice(`Akun guru "${res.teacher.fullName}" berhasil diperbarui dan disinkronkan.`);
       } else {

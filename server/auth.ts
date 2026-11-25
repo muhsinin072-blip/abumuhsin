@@ -110,6 +110,9 @@ export function hashPassword(password: string): string {
 }
 
 export function verifyPasswordHash(password: string, storedHash: string): boolean {
+  if (!storedHash || typeof storedHash !== 'string') {
+    return false;
+  }
   const parts = storedHash.split(':');
   if (parts.length !== 2) {
     return false;

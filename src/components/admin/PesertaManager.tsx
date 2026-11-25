@@ -37,16 +37,18 @@ export const PesertaManager: React.FC<PesertaManagerProps> = ({ settings }) => {
   const [printClassModalOpen, setPrintClassModalOpen] = useState(false);
   const [printingTarget, setPrintingTarget] = useState<string | null>(null);
 
-  const loadStudents = useCallback(async () => {
-    setLoading(true);
+  const loadStudents = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
     try {
       const data = await apiFetch<StudentsResponse>('/api/admin/students');
       setStudents(data.students);
       setError('');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Gagal memuat data peserta.');
+      if (!silent) {
+        setError(err instanceof Error ? err.message : 'Gagal memuat data peserta.');
+      }
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }, []);
 
@@ -54,7 +56,7 @@ export const PesertaManager: React.FC<PesertaManagerProps> = ({ settings }) => {
     loadStudents();
     const ws = createCbtWebSocket((event) => {
       if (event === 'sync:students') {
-        loadStudents();
+        loadStudents(true);
       }
     });
     return () => ws.close();

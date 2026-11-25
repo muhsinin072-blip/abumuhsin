@@ -792,8 +792,8 @@ interface CachedStoreState {
 }
 
 const contextStorage = new AsyncLocalStorage<StoreContext>();
-const USE_IN_PROCESS_CACHE = process.env.VERCEL !== '1';
-const PG_CACHE_TTL_MS = 3000;
+const USE_IN_PROCESS_CACHE = true;
+const PG_CACHE_TTL_MS = process.env.VERCEL === '1' ? 0 : 8000;
 const PRESENCE_REFRESH_MS = 8000;
 
 function docKey(collection: string, id: string): string {

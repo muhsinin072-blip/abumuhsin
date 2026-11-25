@@ -131,10 +131,32 @@ function delayMs(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
+function isNetworkFetchError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  if (err instanceof TypeError) return true;
+  if (err.name === 'AbortError') return true;
+  const msg = err.message.toLowerCase();
+  return (
+    msg.includes('failed to fetch') ||
+    msg.includes('load failed') ||
+    msg.includes('networkerror') ||
+    msg.includes('network request failed')
+  );
+}
+
+function formatNetworkErrorMessage(err: unknown): string {
+  if (err instanceof Error && err.name === 'AbortError') {
+    return 'Waktu tunggu permintaan ke server habis. Silakan coba lagi.';
+  }
+  return 'Gagal terhubung ke server CandyCBT (koneksi terputus atau server sedang sibuk). Silakan coba beberapa saat lagi.';
+}
+
 export async function apiFetch<T>(url: string, options: RequestInit = {}): Promise<T> {
   const method = (options.method || 'GET').toUpperCase();
   const isReadMethod = method === 'GET' || method === 'HEAD';
-  const maxAttempts = isReadMethod ? 4 : 2;
+  const canRetryNetwork = isReadMethod || isLoginEndpoint(url);
+  const maxAttempts = isReadMethod ? 3 : 2;
+  const timeoutMs = isReadMethod ? 15_000 : 25_000;
   let lastError: Error | null = null;
   let verifiedSessionAfter401 = false;
 
@@ -147,10 +169,23 @@ export async function apiFetch<T>(url: string, options: RequestInit = {}): Promi
       headers.set('Authorization', `Bearer ${memoryToken}`);
     }
 
+    const controller = new AbortController();
+    const externalSignal = options.signal;
+    const onExternalAbort = () => controller.abort();
+    if (externalSignal) {
+      if (externalSignal.aborted) {
+        controller.abort();
+      } else {
+        externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+      }
+    }
+    const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+
     try {
       const res = await fetch(url, {
         ...options,
         headers,
+        signal: controller.signal,
       });
 
       const refreshedToken = res.headers.get('x-refreshed-token');
@@ -242,13 +277,24 @@ export async function apiFetch<T>(url: string, options: RequestInit = {}): Promi
         `Respon server tidak valid (${res.status}, bukan JSON). Pastikan endpoint API backend aktif.`
       );
     } catch (err) {
-      const isNetworkErr = err instanceof TypeError;
-      if (attempt < maxAttempts - 1 && isReadMethod && isNetworkErr) {
-        lastError = err;
-        await delayMs(250 * (attempt + 1) + Math.floor(Math.random() * 200));
-        continue;
+      if (externalSignal?.aborted) {
+        throw err instanceof Error ? err : new Error('Permintaan dibatalkan.');
+      }
+      if (isNetworkFetchError(err)) {
+        const friendlyErr = new Error(formatNetworkErrorMessage(err));
+        if (attempt < maxAttempts - 1 && canRetryNetwork) {
+          lastError = friendlyErr;
+          await delayMs(300 * (attempt + 1) + Math.floor(Math.random() * 200));
+          continue;
+        }
+        throw friendlyErr;
       }
       throw err instanceof Error ? err : lastError || new Error('Gagal terhubung ke server.');
+    } finally {
+      window.clearTimeout(timer);
+      if (externalSignal) {
+        externalSignal.removeEventListener('abort', onExternalAbort);
+      }
     }
   }
 

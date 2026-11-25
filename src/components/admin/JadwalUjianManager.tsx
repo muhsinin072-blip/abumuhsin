@@ -24,8 +24,8 @@ export const JadwalUjianManager: React.FC = () => {
   const [saving, setSaving] = useState(false);
   const [modalError, setModalError] = useState('');
 
-  const loadData = useCallback(async () => {
-    setLoading(true);
+  const loadData = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true);
     try {
       const [exRes, bkRes] = await Promise.all([
         apiFetch<ExamsResponse>('/api/admin/exams'),
@@ -38,9 +38,11 @@ export const JadwalUjianManager: React.FC = () => {
         prev && bkRes.banks.some((b) => b.id === prev) ? prev : bkRes.banks[0]?.id || ''
       );
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Gagal memuat jadwal ujian.');
+      if (!silent) {
+        setError(err instanceof Error ? err.message : 'Gagal memuat jadwal ujian.');
+      }
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }, []);
 
@@ -48,7 +50,7 @@ export const JadwalUjianManager: React.FC = () => {
     loadData();
     const ws = createCbtWebSocket((event, payload) => {
       if (event === 'sync:exams' || event === 'sync:banks') {
-        loadData();
+        loadData(true);
       } else if (event === 'token:rotated' && payload) {
         const { examId, token, tokenUpdatedAt } = payload as {
           examId: string;

@@ -93,9 +93,9 @@ function resolvePostgresConfig(): pg.PoolConfig | null {
     return {
       connectionString: cleanedUrl,
       max: poolMax,
-      connectionTimeoutMillis: 12_000,
+      connectionTimeoutMillis: 6_000,
       idleTimeoutMillis: isServerless ? 10_000 : 20_000,
-      query_timeout: 15_000,
+      query_timeout: 8_000,
       keepAlive: true,
       allowExitOnIdle: isServerless,
       ...(useSsl
@@ -127,9 +127,9 @@ function resolvePostgresConfig(): pg.PoolConfig | null {
       user,
       password,
       max: poolMax,
-      connectionTimeoutMillis: 12_000,
+      connectionTimeoutMillis: 6_000,
       idleTimeoutMillis: isServerless ? 10_000 : 20_000,
-      query_timeout: 15_000,
+      query_timeout: 8_000,
       keepAlive: true,
       allowExitOnIdle: isServerless,
       ...(useSsl
@@ -291,7 +291,7 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function withPgRetry<T>(fn: () => Promise<T>, attempts = 4): Promise<T> {
+async function withPgRetry<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
   let lastErr: unknown;
   for (let i = 0; i < attempts; i++) {
     try {
@@ -1050,52 +1050,53 @@ export async function dbFlushChanges(
     try {
       return await withPgRetry(async () => {
         await ensurePgSchema();
-        const client = await pgPool!.connect();
-        try {
-          await client.query('BEGIN');
-          if (upserts.length > 0) {
-            await client.query(
-              `INSERT INTO cbt_docs (collection, id, pos, data)
+        const hasDocChanges = upserts.length > 0 || deletes.length > 0;
+        const upsertsJson = upserts.length > 0 ? sanitizeJsonForPg(upserts) : '[]';
+        const deletesJson = deletes.length > 0 ? sanitizeJsonForPg(deletes) : '[]';
+        const eventsJson =
+          events.length > 0
+            ? sanitizeJsonForPg(events.map((e) => ({ ...e, payload: e.payload ?? null })))
+            : '[]';
+
+        const { rows } = await pgPool!.query<{ version: string | null }>(
+          `WITH
+             u AS (
+               INSERT INTO cbt_docs (collection, id, pos, data)
                SELECT x.collection, x.id, x.pos, x.data
                FROM jsonb_to_recordset($1::jsonb) AS x(collection text, id text, pos double precision, data jsonb)
                ON CONFLICT (collection, id) DO UPDATE
-               SET pos = EXCLUDED.pos, data = EXCLUDED.data, updated_at = now()`,
-              [sanitizeJsonForPg(upserts)]
-            );
-          }
-          if (deletes.length > 0) {
-            await client.query(
-              `DELETE FROM cbt_docs d
-               USING jsonb_to_recordset($1::jsonb) AS x(collection text, id text)
-               WHERE d.collection = x.collection AND d.id = x.id`,
-              [sanitizeJsonForPg(deletes)]
-            );
-          }
-          if (events.length > 0) {
-            await client.query(
-              `INSERT INTO cbt_events (audience, event, payload)
+               SET pos = EXCLUDED.pos, data = EXCLUDED.data, updated_at = now()
+               RETURNING 1
+             ),
+             d AS (
+               DELETE FROM cbt_docs doc
+               USING jsonb_to_recordset($2::jsonb) AS x(collection text, id text)
+               WHERE doc.collection = x.collection AND doc.id = x.id
+               RETURNING 1
+             ),
+             e AS (
+               INSERT INTO cbt_events (audience, event, payload)
                SELECT x.audience, x.event, x.payload
-               FROM jsonb_to_recordset($1::jsonb) AS x(audience text, event text, payload jsonb)`,
-              [sanitizeJsonForPg(events.map((e) => ({ ...e, payload: e.payload ?? null })))]
-            );
-          }
-          let nextVersion: number | null = null;
-          if (upserts.length > 0 || deletes.length > 0) {
-            const vRes = await client.query<{ value: string }>(
-              `INSERT INTO cbt_meta (key, value) VALUES ('docs_version', '1')
-               ON CONFLICT (key) DO UPDATE SET value = ((CASE WHEN cbt_meta.value ~ '^[0-9]+$' THEN cbt_meta.value::bigint ELSE 0 END) + 1)::text
-               RETURNING value`
-            );
-            nextVersion = Number(vRes.rows[0]?.value || 1);
-          }
-          await client.query('COMMIT');
-          return nextVersion;
-        } catch (err) {
-          await client.query('ROLLBACK').catch(() => undefined);
-          throw err;
-        } finally {
-          client.release();
-        }
+               FROM jsonb_to_recordset($3::jsonb) AS x(audience text, event text, payload jsonb)
+               RETURNING 1
+             ),
+             v AS (
+               INSERT INTO cbt_meta (key, value)
+               SELECT 'docs_version', '1'
+               WHERE $4::boolean
+               ON CONFLICT (key) DO UPDATE
+               SET value = ((CASE WHEN cbt_meta.value ~ '^[0-9]+$' THEN cbt_meta.value::bigint ELSE 0 END) + 1)::text
+               RETURNING value
+             )
+           SELECT
+             (SELECT count(*) FROM u) AS upserted,
+             (SELECT count(*) FROM d) AS deleted,
+             (SELECT count(*) FROM e) AS emitted,
+             (SELECT value FROM v LIMIT 1) AS version`,
+          [upsertsJson, deletesJson, eventsJson, hasDocChanges]
+        );
+        const rawVer = rows[0]?.version;
+        return rawVer !== null && rawVer !== undefined ? Number(rawVer) : null;
       });
     } catch (err) {
       if (pgFailedOver || shouldFailoverPgError(err)) {
