@@ -335,6 +335,8 @@ const PG_SCHEMA_STATEMENTS = [
     key text PRIMARY KEY,
     value text NOT NULL
   )`,
+  `CREATE INDEX IF NOT EXISTS cbt_docs_student_nis_idx ON cbt_docs ((data->>'nis')) WHERE collection = 'students'`,
+  `CREATE INDEX IF NOT EXISTS cbt_docs_session_student_exam_idx ON cbt_docs ((data->>'studentId'), (data->>'examId')) WHERE collection = 'sessions'`,
 ];
 
 let pgSchemaReady: Promise<void> | null = null;
@@ -350,15 +352,19 @@ function ensurePgSchema(): Promise<void> {
         events: string | null;
         presence: string | null;
         meta: string | null;
+        stu_idx: string | null;
+        sess_idx: string | null;
       }>(
         `SELECT
            to_regclass('public.cbt_docs')::text AS docs,
            to_regclass('public.cbt_events')::text AS events,
            to_regclass('public.cbt_presence')::text AS presence,
-           to_regclass('public.cbt_meta')::text AS meta`
+           to_regclass('public.cbt_meta')::text AS meta,
+           to_regclass('public.cbt_docs_student_nis_idx')::text AS stu_idx,
+           to_regclass('public.cbt_docs_session_student_exam_idx')::text AS sess_idx`
       );
       const row = check.rows[0];
-      if (row?.docs && row?.events && row?.presence && row?.meta) {
+      if (row?.docs && row?.events && row?.presence && row?.meta && row?.stu_idx && row?.sess_idx) {
         return;
       }
 
@@ -1298,3 +1304,987 @@ export async function dbPollEventsAfter(
     return { cursor, events };
   });
 }
+
+// ---------- POSTGRESQL FAST-PATH PER-DOCUMENT OPERATIONS ----------
+// These bypass full-store loading and use atomic PostgreSQL jsonb updates
+// so 36+ concurrent students never overwrite each other's answers or block on
+// downloading unrelated collections.
+
+export async function dbPgGetPublicInfo(): Promise<{
+  settings: Record<string, unknown>;
+  adminCount: number;
+  sampleStudents: Record<string, unknown>[];
+  sampleTeachers: Record<string, unknown>[];
+} | null> {
+  if (!getIsUsingPostgres() || !pgPool) return null;
+  try {
+    return await withPgRetry(async () => {
+      await ensurePgSchema();
+      const { rows } = await pgPool!.query<{
+        settings: Record<string, unknown> | null;
+        admin_count: number;
+        sample_students: Record<string, unknown>[];
+        sample_teachers: Record<string, unknown>[];
+      }>(
+        `SELECT
+           (SELECT data FROM cbt_docs WHERE collection = 'settings' AND id = 'main' LIMIT 1) AS settings,
+           (SELECT count(*)::int FROM cbt_docs WHERE collection = 'admins') AS admin_count,
+           (SELECT COALESCE(jsonb_agg(d.data), '[]'::jsonb) FROM (
+             SELECT data FROM cbt_docs WHERE collection = 'students' ORDER BY pos, id LIMIT 4
+           ) d) AS sample_students,
+           (SELECT COALESCE(jsonb_agg(d.data), '[]'::jsonb) FROM (
+             SELECT data FROM cbt_docs
+             WHERE collection = 'teachers' AND COALESCE((data->>'isActive')::boolean, true) = true
+             ORDER BY pos, id LIMIT 4
+           ) d) AS sample_teachers`
+      );
+      const row = rows[0];
+      if (!row?.settings) {
+        return null;
+      }
+      return {
+        settings: row.settings,
+        adminCount: Number(row.admin_count || 0),
+        sampleStudents: Array.isArray(row.sample_students) ? row.sample_students : [],
+        sampleTeachers: Array.isArray(row.sample_teachers) ? row.sample_teachers : [],
+      };
+    });
+  } catch (err) {
+    if (pgFailedOver || shouldFailoverPgError(err)) {
+      activatePgFailover(err);
+      return null;
+    }
+    throw err;
+  }
+}
+
+export async function dbPgStudentLoginLookup(nis: string): Promise<{
+  maintenanceMode: boolean;
+  student: Record<string, unknown> | null;
+} | null> {
+  if (!getIsUsingPostgres() || !pgPool) return null;
+  try {
+    return await withPgRetry(async () => {
+      await ensurePgSchema();
+      const { rows } = await pgPool!.query<{
+        has_settings: boolean;
+        maintenance_mode: boolean;
+        student_count: number;
+        student_data: Record<string, unknown> | null;
+      }>(
+        `SELECT
+           EXISTS(SELECT 1 FROM cbt_docs WHERE collection = 'settings' AND id = 'main') AS has_settings,
+           COALESCE((SELECT (data->>'maintenanceMode')::boolean FROM cbt_docs WHERE collection = 'settings' AND id = 'main' LIMIT 1), false) AS maintenance_mode,
+           (SELECT count(*)::int FROM cbt_docs WHERE collection = 'students') AS student_count,
+           (SELECT data FROM cbt_docs WHERE collection = 'students' AND data->>'nis' = $1 LIMIT 1) AS student_data`,
+        [nis]
+      );
+      const row = rows[0];
+      if (!row?.has_settings || Number(row.student_count || 0) === 0) {
+        return null;
+      }
+      return {
+        maintenanceMode: Boolean(row.maintenance_mode),
+        student: row.student_data || null,
+      };
+    });
+  } catch (err) {
+    if (pgFailedOver || shouldFailoverPgError(err)) {
+      activatePgFailover(err);
+      return null;
+    }
+    throw err;
+  }
+}
+
+export async function dbPgFindDocById<T = Record<string, unknown>>(
+  collection: string,
+  id: string
+): Promise<{ found: true; data: T } | { found: false } | null> {
+  if (!getIsUsingPostgres() || !pgPool) return null;
+  try {
+    return await withPgRetry(async () => {
+      await ensurePgSchema();
+      const { rows } = await pgPool!.query<{ data: T }>(
+        `SELECT data FROM cbt_docs WHERE collection = $1 AND id = $2 LIMIT 1`,
+        [collection, id]
+      );
+      if (rows.length === 0) {
+        return { found: false as const };
+      }
+      return { found: true as const, data: rows[0].data };
+    });
+  } catch (err) {
+    if (pgFailedOver || shouldFailoverPgError(err)) {
+      activatePgFailover(err);
+      return null;
+    }
+    throw err;
+  }
+}
+
+export async function dbPgGetStudentExamsContext(studentId: string): Promise<{
+  maintenanceMode: boolean;
+  student: Record<string, unknown> | null;
+  exams: Record<string, unknown>[];
+  banksMeta: { id: string; code: string; kkm: number; questionCount: number }[];
+  sessions: Record<string, unknown>[];
+  broadcasts: Record<string, unknown>[];
+} | null> {
+  if (!getIsUsingPostgres() || !pgPool) return null;
+  try {
+    return await withPgRetry(async () => {
+      await ensurePgSchema();
+      const { rows } = await pgPool!.query<{
+        has_settings: boolean;
+        maintenance_mode: boolean;
+        student_data: Record<string, unknown> | null;
+        exams: Record<string, unknown>[];
+        banks_meta: { id: string; code: string; kkm: number; questionCount: number }[];
+        sessions: Record<string, unknown>[];
+        broadcasts: Record<string, unknown>[];
+      }>(
+        `SELECT
+           EXISTS(SELECT 1 FROM cbt_docs WHERE collection = 'settings' AND id = 'main') AS has_settings,
+           COALESCE((SELECT (data->>'maintenanceMode')::boolean FROM cbt_docs WHERE collection = 'settings' AND id = 'main' LIMIT 1), false) AS maintenance_mode,
+           (SELECT data FROM cbt_docs WHERE collection = 'students' AND id = $1 LIMIT 1) AS student_data,
+           (SELECT COALESCE(jsonb_agg(data ORDER BY pos, id), '[]'::jsonb) FROM cbt_docs WHERE collection = 'exams') AS exams,
+           (SELECT COALESCE(jsonb_agg(jsonb_build_object(
+             'id', data->>'id',
+             'code', COALESCE(data->>'code', '-'),
+             'kkm', CASE WHEN (data->>'kkm') ~ '^[0-9]+(\\.[0-9]+)?$' THEN (data->>'kkm')::numeric ELSE 75 END,
+             'questionCount', jsonb_array_length(COALESCE(data->'questions', '[]'::jsonb))
+           )), '[]'::jsonb) FROM cbt_docs WHERE collection = 'banks') AS banks_meta,
+           (SELECT COALESCE(jsonb_agg(data), '[]'::jsonb) FROM cbt_docs WHERE collection = 'sessions' AND data->>'studentId' = $1) AS sessions,
+           (SELECT COALESCE(jsonb_agg(d.data), '[]'::jsonb) FROM (
+             SELECT data FROM cbt_docs WHERE collection = 'broadcasts' ORDER BY pos, id LIMIT 5
+           ) d) AS broadcasts`,
+        [studentId]
+      );
+      const row = rows[0];
+      if (!row?.has_settings) return null;
+      return {
+        maintenanceMode: Boolean(row.maintenance_mode),
+        student: row.student_data || null,
+        exams: Array.isArray(row.exams) ? row.exams : [],
+        banksMeta: Array.isArray(row.banks_meta) ? row.banks_meta : [],
+        sessions: Array.isArray(row.sessions) ? row.sessions : [],
+        broadcasts: Array.isArray(row.broadcasts) ? row.broadcasts : [],
+      };
+    });
+  } catch (err) {
+    if (pgFailedOver || shouldFailoverPgError(err)) {
+      activatePgFailover(err);
+      return null;
+    }
+    throw err;
+  }
+}
+
+export async function dbPgGetStudentMaterialsContext(studentId: string): Promise<{
+  student: Record<string, unknown> | null;
+  materials: Record<string, unknown>[];
+} | null> {
+  if (!getIsUsingPostgres() || !pgPool) return null;
+  try {
+    return await withPgRetry(async () => {
+      await ensurePgSchema();
+      const { rows } = await pgPool!.query<{
+        student_data: Record<string, unknown> | null;
+        materials: Record<string, unknown>[];
+      }>(
+        `SELECT
+           (SELECT data FROM cbt_docs WHERE collection = 'students' AND id = $1 LIMIT 1) AS student_data,
+           (SELECT COALESCE(jsonb_agg(data ORDER BY pos, id), '[]'::jsonb)
+            FROM cbt_docs
+            WHERE collection = 'materials' AND COALESCE((data->>'isPublished')::boolean, false) = true) AS materials`,
+        [studentId]
+      );
+      const row = rows[0];
+      return {
+        student: row?.student_data || null,
+        materials: Array.isArray(row?.materials) ? row.materials : [],
+      };
+    });
+  } catch (err) {
+    if (pgFailedOver || shouldFailoverPgError(err)) {
+      activatePgFailover(err);
+      return null;
+    }
+    throw err;
+  }
+}
+
+export async function dbPgGetStartExamContext(
+  studentId: string,
+  examId: string
+): Promise<{
+  maintenanceMode: boolean;
+  student: Record<string, unknown> | null;
+  exam: Record<string, unknown> | null;
+  bank: Record<string, unknown> | null;
+  session: Record<string, unknown> | null;
+} | null> {
+  if (!getIsUsingPostgres() || !pgPool) return null;
+  try {
+    return await withPgRetry(async () => {
+      await ensurePgSchema();
+      const { rows } = await pgPool!.query<{
+        has_settings: boolean;
+        maintenance_mode: boolean;
+        student_data: Record<string, unknown> | null;
+        exam_data: Record<string, unknown> | null;
+        bank_data: Record<string, unknown> | null;
+        session_data: Record<string, unknown> | null;
+      }>(
+        `SELECT
+           EXISTS(SELECT 1 FROM cbt_docs WHERE collection = 'settings' AND id = 'main') AS has_settings,
+           COALESCE((SELECT (data->>'maintenanceMode')::boolean FROM cbt_docs WHERE collection = 'settings' AND id = 'main' LIMIT 1), false) AS maintenance_mode,
+           (SELECT data FROM cbt_docs WHERE collection = 'students' AND id = $1 LIMIT 1) AS student_data,
+           (SELECT data FROM cbt_docs WHERE collection = 'exams' AND id = $2 LIMIT 1) AS exam_data,
+           (SELECT b.data FROM cbt_docs b
+            JOIN cbt_docs e ON e.collection = 'exams' AND e.id = $2
+            WHERE b.collection = 'banks' AND b.id = e.data->>'bankId'
+            LIMIT 1) AS bank_data,
+           (SELECT data FROM cbt_docs WHERE collection = 'sessions' AND data->>'studentId' = $1 AND data->>'examId' = $2 LIMIT 1) AS session_data`,
+        [studentId, examId]
+      );
+      const row = rows[0];
+      if (!row?.has_settings) return null;
+      return {
+        maintenanceMode: Boolean(row.maintenance_mode),
+        student: row.student_data || null,
+        exam: row.exam_data || null,
+        bank: row.bank_data || null,
+        session: row.session_data || null,
+      };
+    });
+  } catch (err) {
+    if (pgFailedOver || shouldFailoverPgError(err)) {
+      activatePgFailover(err);
+      return null;
+    }
+    throw err;
+  }
+}
+
+export async function dbPgInsertOrResumeSession(params: {
+  newSession?: Record<string, unknown>;
+  resumeSessionId?: string;
+  studentId: string;
+  examId: string;
+  nowIso: string;
+}): Promise<{ session: Record<string, unknown>; version: number | null } | null> {
+  if (!getIsUsingPostgres() || !pgPool) return null;
+  try {
+    return await withPgRetry(async () => {
+      await ensurePgSchema();
+      if (params.newSession) {
+        const sessionJson = sanitizeJsonForPg(params.newSession);
+        const sessionId = String(params.newSession.id);
+        const client = await pgPool!.connect();
+        try {
+          await client.query('BEGIN');
+          await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [
+            `sess:${params.studentId}:${params.examId}`,
+          ]);
+          const { rows } = await client.query<{
+            session_data: Record<string, unknown> | null;
+            version: string | null;
+          }>(
+            `WITH ins AS (
+               INSERT INTO cbt_docs (collection, id, pos, data)
+               SELECT 'sessions', $1, extract(epoch from now()), $2::jsonb
+               WHERE NOT EXISTS (
+                 SELECT 1 FROM cbt_docs WHERE collection = 'sessions' AND data->>'studentId' = $3 AND data->>'examId' = $4
+               )
+               ON CONFLICT (collection, id) DO NOTHING
+               RETURNING data
+             ),
+             ev AS (
+               INSERT INTO cbt_events (audience, event, payload)
+               SELECT 'staff', 'session:updated', data FROM ins
+             ),
+             ver AS (
+               INSERT INTO cbt_meta (key, value)
+               SELECT 'docs_version', '1' WHERE EXISTS (SELECT 1 FROM ins)
+               ON CONFLICT (key) DO UPDATE
+               SET value = ((CASE WHEN cbt_meta.value ~ '^[0-9]+$' THEN cbt_meta.value::bigint ELSE 0 END) + 1)::text
+               RETURNING value
+             )
+             SELECT
+               COALESCE(
+                 (SELECT data FROM ins LIMIT 1),
+                 (SELECT data FROM cbt_docs WHERE collection = 'sessions' AND data->>'studentId' = $3 AND data->>'examId' = $4 LIMIT 1)
+               ) AS session_data,
+               (SELECT value FROM ver LIMIT 1) AS version`,
+            [sessionId, sessionJson, params.studentId, params.examId]
+          );
+          await client.query('COMMIT');
+          const row = rows[0];
+          if (!row?.session_data) return null;
+          return {
+            session: row.session_data,
+            version: row.version ? Number(row.version) : null,
+          };
+        } catch (txErr) {
+          await client.query('ROLLBACK').catch(() => undefined);
+          throw txErr;
+        } finally {
+          client.release();
+        }
+      }
+
+      const { rows } = await pgPool!.query<{
+        session_data: Record<string, unknown> | null;
+        version: string | null;
+      }>(
+        `WITH upd AS (
+           UPDATE cbt_docs
+           SET data = jsonb_set(
+             jsonb_set(data, '{isOnline}', 'true'::jsonb, true),
+             '{lastHeartbeatAt}', to_jsonb($3::text), true
+           ),
+           updated_at = now()
+           WHERE collection = 'sessions' AND id = $1 AND data->>'studentId' = $2
+           RETURNING data
+         ),
+         ev AS (
+           INSERT INTO cbt_events (audience, event, payload)
+           SELECT 'staff', 'session:updated', data FROM upd
+         ),
+         ver AS (
+           INSERT INTO cbt_meta (key, value)
+           SELECT 'docs_version', '1' WHERE EXISTS (SELECT 1 FROM upd)
+           ON CONFLICT (key) DO UPDATE
+           SET value = ((CASE WHEN cbt_meta.value ~ '^[0-9]+$' THEN cbt_meta.value::bigint ELSE 0 END) + 1)::text
+           RETURNING value
+         )
+         SELECT
+           (SELECT data FROM upd LIMIT 1) AS session_data,
+           (SELECT value FROM ver LIMIT 1) AS version`,
+        [params.resumeSessionId || '', params.studentId, params.nowIso]
+      );
+      const row = rows[0];
+      if (!row?.session_data) return null;
+      return {
+        session: row.session_data,
+        version: row.version ? Number(row.version) : null,
+      };
+    });
+  } catch (err) {
+    if (pgFailedOver || shouldFailoverPgError(err)) {
+      activatePgFailover(err);
+      return null;
+    }
+    throw err;
+  }
+}
+
+export async function dbPgSaveStudentAnswers(params: {
+  sessionId: string;
+  studentId: string;
+  answersPatch: Record<string, { questionId: string; answer: string; isDoubtful: boolean; updatedAt: string }>;
+  currentQuestionIndex?: number;
+  nowIso: string;
+  emitAdminEvent: boolean;
+}): Promise<
+  | { kind: 'saved'; session: Record<string, unknown>; version: number | null }
+  | { kind: 'not_found' }
+  | { kind: 'invalid_question' }
+  | { kind: 'conflict'; status: string }
+  | null
+> {
+  if (!getIsUsingPostgres() || !pgPool) return null;
+  try {
+    return await withPgRetry(async () => {
+      await ensurePgSchema();
+      const patchJson = sanitizeJsonForPg(params.answersPatch);
+      const idxParam =
+        typeof params.currentQuestionIndex === 'number' && Number.isFinite(params.currentQuestionIndex)
+          ? Math.max(0, Math.floor(params.currentQuestionIndex))
+          : null;
+
+      const { rows } = await pgPool!.query<{
+        session_data: Record<string, unknown> | null;
+        version: string | null;
+      }>(
+        `WITH upd AS (
+           UPDATE cbt_docs doc
+           SET data = jsonb_set(
+             jsonb_set(
+               jsonb_set(
+                 jsonb_set(
+                   doc.data,
+                   '{answers}',
+                   COALESCE(doc.data->'answers', '{}'::jsonb) || COALESCE((
+                     SELECT jsonb_object_agg(kv.key, kv.value)
+                     FROM jsonb_each($3::jsonb) AS kv
+                     WHERE doc.data->'questionOrder' ? kv.key
+                       AND (
+                         (doc.data->'answers'->kv.key->>'updatedAt') IS NULL
+                         OR COALESCE(kv.value->>'updatedAt', '') >= (doc.data->'answers'->kv.key->>'updatedAt')
+                       )
+                   ), '{}'::jsonb),
+                   true
+                 ),
+                 '{currentQuestionIndex}',
+                 CASE WHEN $4::int IS NOT NULL THEN to_jsonb($4::int) ELSE COALESCE(doc.data->'currentQuestionIndex', '0'::jsonb) END,
+                 true
+               ),
+               '{isOnline}',
+               'true'::jsonb,
+               true
+             ),
+             '{lastHeartbeatAt}',
+             to_jsonb($5::text),
+             true
+           ),
+           updated_at = now()
+           WHERE doc.collection = 'sessions'
+             AND doc.id = $1
+             AND doc.data->>'studentId' = $2
+             AND doc.data->>'status' = 'SEDANG_UJIAN'
+             AND EXISTS (
+               SELECT 1 FROM jsonb_each($3::jsonb) AS kv
+               WHERE doc.data->'questionOrder' ? kv.key
+             )
+           RETURNING doc.data
+         ),
+         ev AS (
+           INSERT INTO cbt_events (audience, event, payload)
+           SELECT 'staff', 'session:updated', data
+           FROM upd
+           WHERE $6::boolean = true
+         ),
+         ver AS (
+           INSERT INTO cbt_meta (key, value)
+           SELECT 'docs_version', '1'
+           WHERE EXISTS (SELECT 1 FROM upd)
+           ON CONFLICT (key) DO UPDATE
+           SET value = ((CASE WHEN cbt_meta.value ~ '^[0-9]+$' THEN cbt_meta.value::bigint ELSE 0 END) + 1)::text
+           RETURNING value
+         )
+         SELECT
+           (SELECT data FROM upd LIMIT 1) AS session_data,
+           (SELECT value FROM ver LIMIT 1) AS version`,
+        [params.sessionId, params.studentId, patchJson, idxParam, params.nowIso, params.emitAdminEvent]
+      );
+
+      const row = rows[0];
+      if (row?.session_data) {
+        return {
+          kind: 'saved' as const,
+          session: row.session_data,
+          version: row.version ? Number(row.version) : null,
+        };
+      }
+
+      const diag = await pgPool!.query<{ status: string | null; valid: boolean }>(
+        `SELECT
+           data->>'status' AS status,
+           EXISTS (SELECT 1 FROM jsonb_each($3::jsonb) AS kv WHERE data->'questionOrder' ? kv.key) AS valid
+         FROM cbt_docs
+         WHERE collection = 'sessions' AND id = $1 AND data->>'studentId' = $2
+         LIMIT 1`,
+        [params.sessionId, params.studentId, patchJson]
+      );
+      if (diag.rows.length === 0) {
+        return { kind: 'not_found' as const };
+      }
+      const d = diag.rows[0];
+      if (d.status && d.status !== 'SEDANG_UJIAN') {
+        return { kind: 'conflict' as const, status: d.status };
+      }
+      return { kind: 'invalid_question' as const };
+    });
+  } catch (err) {
+    if (pgFailedOver || shouldFailoverPgError(err)) {
+      activatePgFailover(err);
+      return null;
+    }
+    throw err;
+  }
+}
+
+export async function dbPgReportViolation(params: {
+  sessionId: string;
+  studentId: string;
+  type: string;
+  description: string;
+  violationId: string;
+  nowIso: string;
+}): Promise<
+  | {
+      kind: 'not_found';
+    }
+  | {
+      kind: 'skipped';
+      status: string;
+      violationCount: number;
+    }
+  | {
+      kind: 'logged';
+      session: Record<string, unknown>;
+      violation: Record<string, unknown>;
+      maxViolations: number;
+      triggeredBlock: boolean;
+      version: number | null;
+    }
+  | null
+> {
+  if (!getIsUsingPostgres() || !pgPool) return null;
+  try {
+    return await withPgRetry(async () => {
+      await ensurePgSchema();
+      const { rows: ctxRows } = await pgPool!.query<{
+        session_data: Record<string, unknown> | null;
+        exam_data: Record<string, unknown> | null;
+      }>(
+        `SELECT
+           s.data AS session_data,
+           (SELECT e.data FROM cbt_docs e WHERE e.collection = 'exams' AND e.id = s.data->>'examId' LIMIT 1) AS exam_data
+         FROM cbt_docs s
+         WHERE s.collection = 'sessions' AND s.id = $1 AND s.data->>'studentId' = $2
+         LIMIT 1`,
+        [params.sessionId, params.studentId]
+      );
+      const ctxRow = ctxRows[0];
+      if (!ctxRow?.session_data) {
+        return { kind: 'not_found' as const };
+      }
+      const sess = ctxRow.session_data;
+      const exam = ctxRow.exam_data;
+      if (sess.status === 'SELESAI' || !exam || !exam.antiCheatEnabled) {
+        return {
+          kind: 'skipped' as const,
+          status: String(sess.status || 'SEDANG_UJIAN'),
+          violationCount: Number(sess.violationCount || 0),
+        };
+      }
+
+      const maxViolations = Math.max(1, Number(exam.maxViolations || 3));
+      const { rows } = await pgPool!.query<{
+        session_data: Record<string, unknown> | null;
+        violation_data: Record<string, unknown> | null;
+        version: string | null;
+      }>(
+        `WITH upd AS (
+           UPDATE cbt_docs
+           SET data = (
+             WITH calc AS (
+               SELECT
+                 (COALESCE((data->>'violationCount')::int, 0) + 1) AS next_count
+             )
+             SELECT
+               jsonb_set(
+                 jsonb_set(
+                   jsonb_set(
+                     data,
+                     '{violationCount}',
+                     to_jsonb((SELECT next_count FROM calc)),
+                     true
+                   ),
+                   '{lastViolationReason}',
+                   to_jsonb($3::text),
+                   true
+                 ),
+                 '{status}',
+                 CASE WHEN (SELECT next_count FROM calc) >= $4::int THEN '"TERBLOKIR"'::jsonb ELSE COALESCE(data->'status', '"SEDANG_UJIAN"'::jsonb) END,
+                 true
+               ) ||
+               CASE WHEN (COALESCE((data->>'violationCount')::int, 0) + 1) >= $4::int
+                 THEN jsonb_build_object('blockedAt', $5::text)
+                 ELSE '{}'::jsonb
+               END
+           ),
+           updated_at = now()
+           WHERE collection = 'sessions' AND id = $1 AND data->>'studentId' = $2 AND data->>'status' <> 'SELESAI'
+           RETURNING data
+         ),
+         viol_obj AS (
+           SELECT jsonb_build_object(
+             'id', $6::text,
+             'sessionId', u.data->>'id',
+             'examId', u.data->>'examId',
+             'examTitle', $7::text,
+             'studentId', u.data->>'studentId',
+             'studentNis', COALESCE(u.data->>'studentNis', ''),
+             'studentName', COALESCE(u.data->>'studentName', ''),
+             'className', COALESCE(u.data->>'className', ''),
+             'room', COALESCE(u.data->>'room', ''),
+             'type', $8::text,
+             'description', $3::text,
+             'countAtTime', COALESCE((u.data->>'violationCount')::int, 1),
+             'triggeredBlock', (COALESCE((u.data->>'violationCount')::int, 1) >= $4::int),
+             'timestamp', $5::text
+           ) AS vdata
+           FROM upd u
+         ),
+         ins_viol AS (
+           INSERT INTO cbt_docs (collection, id, pos, data)
+           SELECT 'violations', $6::text, -extract(epoch from now()), vdata
+           FROM viol_obj
+           ON CONFLICT (collection, id) DO NOTHING
+           RETURNING data
+         ),
+         ev1 AS (
+           INSERT INTO cbt_events (audience, event, payload)
+           SELECT 'staff', 'violation:logged', data FROM ins_viol
+         ),
+         ev2 AS (
+           INSERT INTO cbt_events (audience, event, payload)
+           SELECT 'staff', 'session:updated', data FROM upd
+         ),
+         ver AS (
+           INSERT INTO cbt_meta (key, value)
+           SELECT 'docs_version', '1' WHERE EXISTS (SELECT 1 FROM upd)
+           ON CONFLICT (key) DO UPDATE
+           SET value = ((CASE WHEN cbt_meta.value ~ '^[0-9]+$' THEN cbt_meta.value::bigint ELSE 0 END) + 1)::text
+           RETURNING value
+         )
+         SELECT
+           (SELECT data FROM upd LIMIT 1) AS session_data,
+           (SELECT data FROM ins_viol LIMIT 1) AS violation_data,
+           (SELECT value FROM ver LIMIT 1) AS version`,
+        [
+          params.sessionId,
+          params.studentId,
+          params.description,
+          maxViolations,
+          params.nowIso,
+          params.violationId,
+          String(exam.title || 'Ujian CBT'),
+          params.type,
+        ]
+      );
+
+      const out = rows[0];
+      if (!out?.session_data || !out?.violation_data) {
+        return {
+          kind: 'skipped' as const,
+          status: String(sess.status || 'SELESAI'),
+          violationCount: Number(sess.violationCount || 0),
+        };
+      }
+      const vCount = Number(out.session_data.violationCount || 1);
+      return {
+        kind: 'logged' as const,
+        session: out.session_data,
+        violation: out.violation_data,
+        maxViolations,
+        triggeredBlock: vCount >= maxViolations,
+        version: out.version ? Number(out.version) : null,
+      };
+    });
+  } catch (err) {
+    if (pgFailedOver || shouldFailoverPgError(err)) {
+      activatePgFailover(err);
+      return null;
+    }
+    throw err;
+  }
+}
+
+export async function dbPgFinishStudentSession(params: {
+  sessionId: string;
+  studentId: string;
+  clientAnswersPatch: Record<string, { questionId: string; answer: string; isDoubtful: boolean; updatedAt: string }> | null;
+  nowIso: string;
+  scoreSession: (session: Record<string, unknown>, bank: Record<string, unknown> | undefined) => Record<string, unknown>;
+}): Promise<
+  | { kind: 'not_found' }
+  | {
+      kind: 'finished';
+      session: Record<string, unknown>;
+      exam: Record<string, unknown> | undefined;
+      bank: Record<string, unknown> | undefined;
+      version: number | null;
+    }
+  | null
+> {
+  if (!getIsUsingPostgres() || !pgPool) return null;
+  try {
+    return await withPgRetry(async () => {
+      await ensurePgSchema();
+      const hasClientPatch = Boolean(params.clientAnswersPatch && Object.keys(params.clientAnswersPatch).length > 0);
+      const patchJson = hasClientPatch ? sanitizeJsonForPg(params.clientAnswersPatch) : '{}';
+
+      // Step 1: Merge any client-side pending/unsynced answers atomically if still SEDANG_UJIAN,
+      // and read back the authoritative session, exam, and bank from PG.
+      const { rows: loadRows } = await pgPool!.query<{
+        session_data: Record<string, unknown> | null;
+        exam_data: Record<string, unknown> | null;
+        bank_data: Record<string, unknown> | null;
+      }>(
+        `WITH target AS (
+           SELECT id, data
+           FROM cbt_docs
+           WHERE collection = 'sessions' AND id = $1 AND data->>'studentId' = $2
+           LIMIT 1
+         ),
+         filtered_patch AS (
+           SELECT COALESCE(jsonb_object_agg(kv.key, kv.value), '{}'::jsonb) AS obj
+           FROM jsonb_each($3::jsonb) AS kv
+           CROSS JOIN target t
+           WHERE $4::boolean = true
+             AND t.data->>'status' = 'SEDANG_UJIAN'
+             AND t.data->'questionOrder' ? kv.key
+             AND (
+               (t.data->'answers'->kv.key->>'updatedAt') IS NULL
+               OR COALESCE(kv.value->>'updatedAt', '') >= (t.data->'answers'->kv.key->>'updatedAt')
+             )
+         ),
+         merged AS (
+           UPDATE cbt_docs doc
+           SET data = jsonb_set(
+             doc.data,
+             '{answers}',
+             COALESCE(doc.data->'answers', '{}'::jsonb) || fp.obj,
+             true
+           ),
+           updated_at = now()
+           FROM target t, filtered_patch fp
+           WHERE doc.collection = 'sessions'
+             AND doc.id = t.id
+             AND t.data->>'status' = 'SEDANG_UJIAN'
+             AND fp.obj <> '{}'::jsonb
+           RETURNING doc.data
+         ),
+         latest_sess AS (
+           SELECT COALESCE((SELECT data FROM merged LIMIT 1), (SELECT data FROM target LIMIT 1)) AS data
+         )
+         SELECT
+           ls.data AS session_data,
+           (SELECT e.data FROM cbt_docs e WHERE e.collection = 'exams' AND e.id = ls.data->>'examId' LIMIT 1) AS exam_data,
+           (SELECT b.data FROM cbt_docs b
+            JOIN cbt_docs e ON e.collection = 'exams' AND e.id = ls.data->>'examId'
+            WHERE b.collection = 'banks' AND b.id = e.data->>'bankId'
+            LIMIT 1) AS bank_data
+         FROM latest_sess ls`,
+        [params.sessionId, params.studentId, patchJson, hasClientPatch]
+      );
+
+      const loaded = loadRows[0];
+      if (!loaded?.session_data) {
+        return { kind: 'not_found' as const };
+      }
+
+      const session = loaded.session_data;
+      const exam = loaded.exam_data || undefined;
+      const bank = loaded.bank_data || undefined;
+
+      if (session.status === 'SELESAI') {
+        return {
+          kind: 'finished' as const,
+          session,
+          exam,
+          bank,
+          version: null,
+        };
+      }
+
+      session.status = 'SELESAI';
+      session.finishedAt = params.nowIso;
+      session.isOnline = false;
+      const scored = params.scoreSession(session, bank);
+
+      // Step 2: Patch ONLY finish/score fields via JSONB || so answers are preserved intact.
+      const scorePatch = sanitizeJsonForPg({
+        status: 'SELESAI',
+        finishedAt: scored.finishedAt,
+        isOnline: false,
+        pgCorrect: scored.pgCorrect,
+        pgTotal: scored.pgTotal,
+        pgScore: scored.pgScore,
+        essayScore: scored.essayScore,
+        finalScore: scored.finalScore,
+      });
+
+      const { rows: finRows } = await pgPool!.query<{
+        session_data: Record<string, unknown> | null;
+        version: string | null;
+      }>(
+        `WITH upd AS (
+           UPDATE cbt_docs
+           SET data = data || $3::jsonb,
+               updated_at = now()
+           WHERE collection = 'sessions' AND id = $1 AND data->>'studentId' = $2
+           RETURNING data
+         ),
+         ev1 AS (
+           INSERT INTO cbt_events (audience, event, payload)
+           SELECT 'staff', 'session:updated', data FROM upd
+         ),
+         ev2 AS (
+           INSERT INTO cbt_events (audience, event, payload)
+           SELECT 'staff', 'sync:results', jsonb_build_object('sessionId', data->>'id', 'examId', data->>'examId') FROM upd
+         ),
+         ver AS (
+           INSERT INTO cbt_meta (key, value)
+           SELECT 'docs_version', '1' WHERE EXISTS (SELECT 1 FROM upd)
+           ON CONFLICT (key) DO UPDATE
+           SET value = ((CASE WHEN cbt_meta.value ~ '^[0-9]+$' THEN cbt_meta.value::bigint ELSE 0 END) + 1)::text
+           RETURNING value
+         )
+         SELECT
+           (SELECT data FROM upd LIMIT 1) AS session_data,
+           (SELECT value FROM ver LIMIT 1) AS version`,
+        [params.sessionId, params.studentId, scorePatch]
+      );
+
+      return {
+        kind: 'finished' as const,
+        session: finRows[0]?.session_data || scored,
+        exam,
+        bank,
+        version: finRows[0]?.version ? Number(finRows[0].version) : null,
+      };
+    });
+  } catch (err) {
+    if (pgFailedOver || shouldFailoverPgError(err)) {
+      activatePgFailover(err);
+      return null;
+    }
+    throw err;
+  }
+}
+
+export async function dbPgStudentHeartbeat(params: {
+  sessionId: string;
+  studentId: string;
+  currentQuestionIndex?: number;
+  nowIso: string;
+  emitAdminEvent: boolean;
+}): Promise<{ session: Record<string, unknown>; version: number | null } | null> {
+  if (!getIsUsingPostgres() || !pgPool) return null;
+  try {
+    return await withPgRetry(async () => {
+      await ensurePgSchema();
+      const idxParam =
+        typeof params.currentQuestionIndex === 'number' && params.currentQuestionIndex >= 0
+          ? Math.floor(params.currentQuestionIndex)
+          : null;
+
+      const { rows } = await pgPool!.query<{
+        session_data: Record<string, unknown> | null;
+        structural_change: boolean;
+        version: string | null;
+      }>(
+        `WITH prev AS (
+           SELECT
+             COALESCE((data->>'isOnline')::boolean, false) AS was_online,
+             COALESCE((data->>'currentQuestionIndex')::int, 0) AS prev_idx
+           FROM cbt_docs
+           WHERE collection = 'sessions' AND id = $1 AND data->>'studentId' = $2
+           LIMIT 1
+         ),
+         upd AS (
+           UPDATE cbt_docs
+           SET data = jsonb_set(
+             jsonb_set(
+               jsonb_set(data, '{isOnline}', 'true'::jsonb, true),
+               '{lastHeartbeatAt}', to_jsonb($3::text), true
+             ),
+             '{currentQuestionIndex}',
+             CASE WHEN $4::int IS NOT NULL THEN to_jsonb($4::int) ELSE COALESCE(data->'currentQuestionIndex', '0'::jsonb) END,
+             true
+           ),
+           updated_at = now()
+           WHERE collection = 'sessions' AND id = $1 AND data->>'studentId' = $2
+           RETURNING data
+         ),
+         flags AS (
+           SELECT
+             COALESCE((SELECT (NOT was_online) OR ($4::int IS NOT NULL AND $4::int <> prev_idx) FROM prev LIMIT 1), false) AS changed
+         ),
+         ev AS (
+           INSERT INTO cbt_events (audience, event, payload)
+           SELECT 'staff', 'session:updated', u.data
+           FROM upd u, flags f
+           WHERE $5::boolean = true OR f.changed = true
+         ),
+         ver AS (
+           INSERT INTO cbt_meta (key, value)
+           SELECT 'docs_version', '1'
+           FROM flags f
+           WHERE EXISTS (SELECT 1 FROM upd) AND f.changed = true
+           ON CONFLICT (key) DO UPDATE
+           SET value = ((CASE WHEN cbt_meta.value ~ '^[0-9]+$' THEN cbt_meta.value::bigint ELSE 0 END) + 1)::text
+           RETURNING value
+         )
+         SELECT
+           (SELECT data FROM upd LIMIT 1) AS session_data,
+           (SELECT changed FROM flags LIMIT 1) AS structural_change,
+           (SELECT value FROM ver LIMIT 1) AS version`,
+        [params.sessionId, params.studentId, params.nowIso, idxParam, params.emitAdminEvent]
+      );
+      const row = rows[0];
+      if (!row?.session_data) return null;
+      return {
+        session: row.session_data,
+        version: row.version ? Number(row.version) : null,
+      };
+    });
+  } catch (err) {
+    if (pgFailedOver || shouldFailoverPgError(err)) {
+      activatePgFailover(err);
+      return null;
+    }
+    throw err;
+  }
+}
+
+export async function dbPgMarkStaleSessionsOffline(cutoffIso: string): Promise<{
+  updatedSessions: Record<string, unknown>[];
+  version: number | null;
+} | null> {
+  if (!getIsUsingPostgres() || !pgPool) return null;
+  try {
+    return await withPgRetry(async () => {
+      await ensurePgSchema();
+      const { rows } = await pgPool!.query<{
+        updated_sessions: Record<string, unknown>[];
+        version: string | null;
+      }>(
+        `WITH upd AS (
+           UPDATE cbt_docs
+           SET data = jsonb_set(data, '{isOnline}', 'false'::jsonb, true),
+               updated_at = now()
+           WHERE collection = 'sessions'
+             AND COALESCE((data->>'isOnline')::boolean, false) = true
+             AND data->>'status' IN ('SEDANG_UJIAN', 'TERBLOKIR')
+             AND COALESCE(data->>'lastHeartbeatAt', '') < $1
+           RETURNING data
+         ),
+         ev AS (
+           INSERT INTO cbt_events (audience, event, payload)
+           SELECT 'staff', 'session:updated', data FROM upd
+         ),
+         ver AS (
+           INSERT INTO cbt_meta (key, value)
+           SELECT 'docs_version', '1' WHERE EXISTS (SELECT 1 FROM upd)
+           ON CONFLICT (key) DO UPDATE
+           SET value = ((CASE WHEN cbt_meta.value ~ '^[0-9]+$' THEN cbt_meta.value::bigint ELSE 0 END) + 1)::text
+           RETURNING value
+         )
+         SELECT
+           COALESCE((SELECT jsonb_agg(data) FROM upd), '[]'::jsonb) AS updated_sessions,
+           (SELECT value FROM ver LIMIT 1) AS version`,
+        [cutoffIso]
+      );
+      const row = rows[0];
+      return {
+        updatedSessions: Array.isArray(row?.updated_sessions) ? row.updated_sessions : [],
+        version: row?.version ? Number(row.version) : null,
+      };
+    });
+  } catch (err) {
+    if (pgFailedOver || shouldFailoverPgError(err)) {
+      activatePgFailover(err);
+      return null;
+    }
+    throw err;
+  }
+}
+

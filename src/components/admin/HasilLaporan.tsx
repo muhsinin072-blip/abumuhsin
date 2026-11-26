@@ -36,29 +36,34 @@ export const HasilLaporan: React.FC<HasilLaporanProps> = ({ userRole = 'admin' }
   const [purging, setPurging] = useState(false);
   const [purgeError, setPurgeError] = useState('');
 
-  const loadResults = useCallback(async () => {
-    setLoading(true);
+  const loadResults = useCallback(async (silent = false) => {
+    if (!silent) {
+      setLoading(true);
+    }
     try {
       const res = await apiFetch<AdminResultsResponse>('/api/admin/results');
       setData(res);
       setError('');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Gagal memuat hasil ujian.');
+      if (!silent) {
+        setError(err instanceof Error ? err.message : 'Gagal memuat hasil ujian.');
+      }
     } finally {
-      setLoading(false);
+      if (!silent) {
+        setLoading(false);
+      }
     }
   }, []);
 
   useEffect(() => {
-    loadResults();
+    void loadResults(false);
     const ws = createCbtWebSocket((event) => {
       if (
         event === 'sync:results' ||
-        event === 'session:updated' ||
         event === 'sync:settings' ||
         event === 'violation:logged'
       ) {
-        loadResults();
+        void loadResults(true);
       }
     });
     return () => ws.close();
@@ -110,7 +115,7 @@ export const HasilLaporan: React.FC<HasilLaporanProps> = ({ userRole = 'admin' }
       });
       setGradingSession(null);
       setNotice(`Nilai esai untuk ${gradingSession.studentName} berhasil diperbarui.`);
-      loadResults();
+      void loadResults(true);
     } catch (err) {
       setEssayModalError(err instanceof Error ? err.message : 'Gagal menyimpan koreksi esai.');
     } finally {
@@ -137,7 +142,7 @@ export const HasilLaporan: React.FC<HasilLaporanProps> = ({ userRole = 'admin' }
       setPurgeOpen(false);
       setPurgeConfirmText('');
       setNotice(res.message || 'Seluruh jawaban soal, nilai, dan log ujian berhasil dihapus.');
-      void loadResults();
+      void loadResults(true);
     } catch (err) {
       setPurgeError(err instanceof Error ? err.message : 'Gagal menghapus database jawaban & nilai.');
     } finally {

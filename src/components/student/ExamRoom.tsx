@@ -12,7 +12,7 @@ import {
   ShieldAlert,
   Volume2,
 } from 'lucide-react';
-import { apiFetch, createCbtWebSocket } from '../../lib/api';
+import { apiFetch, createCbtWebSocket, getAuthToken } from '../../lib/api';
 import type { StartExamResponse } from '../../lib/api';
 import type { AuthUser, BroadcastNotice, ExamSessionStatus, ViolationType } from '../../types/cbt';
 import { LiveClockDate } from '../LiveClockDate';
@@ -142,33 +142,53 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
           if (statusRef.current !== 'SEDANG_UJIAN') {
             break;
           }
-          const firstEntry = pendingAnswersRef.current.values().next().value;
-          if (!firstEntry) break;
+          const batchItems = Array.from(pendingAnswersRef.current.values());
+          if (batchItems.length === 0) break;
+
+          const answersBatch: Record<
+            string,
+            { questionId: string; answer: string; isDoubtful: boolean; updatedAt: string }
+          > = {};
+          let latestIdx = currentIdxRef.current;
+          for (const item of batchItems) {
+            answersBatch[item.questionId] = {
+              questionId: item.questionId,
+              answer: item.answer,
+              isDoubtful: item.isDoubtful,
+              updatedAt: item.updatedAt,
+            };
+            latestIdx = item.idx;
+          }
 
           setSavingIndicator('saving');
           try {
             await apiFetch(`/api/student/sessions/${sessionId}/answer`, {
               method: 'POST',
               body: JSON.stringify({
-                questionId: firstEntry.questionId,
-                answer: firstEntry.answer,
-                isDoubtful: firstEntry.isDoubtful,
-                currentQuestionIndex: firstEntry.idx,
+                answers: answersBatch,
+                currentQuestionIndex: latestIdx,
               }),
             });
             lastServerActivityRef.current = Date.now();
-            lastSentQuestionIdxRef.current = firstEntry.idx;
+            lastSentQuestionIdxRef.current = latestIdx;
             consecutiveFailures = 0;
 
-            const latest = pendingAnswersRef.current.get(firstEntry.questionId);
-            if (latest && latest.updatedAt === firstEntry.updatedAt) {
-              pendingAnswersRef.current.delete(firstEntry.questionId);
-              saveDraftToStorage();
+            for (const item of batchItems) {
+              const latest = pendingAnswersRef.current.get(item.questionId);
+              if (latest && latest.updatedAt === item.updatedAt) {
+                pendingAnswersRef.current.delete(item.questionId);
+              }
             }
+            saveDraftToStorage();
           } catch (err) {
             const msg = err instanceof Error ? err.message : '';
-            if (/status ujian|id soal tidak valid|sesi ujian tidak ditemukan|kedaluwarsa/i.test(msg)) {
-              pendingAnswersRef.current.delete(firstEntry.questionId);
+            if (/status ujian|sesi ujian tidak ditemukan|kedaluwarsa|id soal tidak valid/i.test(msg)) {
+              for (const item of batchItems) {
+                const latest = pendingAnswersRef.current.get(item.questionId);
+                if (latest && latest.updatedAt === item.updatedAt) {
+                  pendingAnswersRef.current.delete(item.questionId);
+                }
+              }
               saveDraftToStorage();
               continue;
             }
@@ -177,7 +197,7 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
             if (consecutiveFailures >= maxFailures) {
               break;
             }
-            const backoffMs = Math.min(8_000, 1_200 * Math.pow(2, consecutiveFailures - 1));
+            const backoffMs = Math.min(6_000, 800 * Math.pow(2, consecutiveFailures - 1));
             await new Promise<void>((resolve) => {
               retryTimerRef.current = window.setTimeout(() => {
                 retryTimerRef.current = null;
@@ -249,14 +269,48 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
     } catch {
       // ignore malformed draft
     }
+    const handlePageHide = () => {
+      if (pendingAnswersRef.current.size === 0 || statusRef.current !== 'SEDANG_UJIAN') return;
+      saveDraftToStorage();
+      const token = getAuthToken();
+      if (!token) return;
+      const answersBatch: Record<
+        string,
+        { questionId: string; answer: string; isDoubtful: boolean; updatedAt: string }
+      > = {};
+      for (const item of pendingAnswersRef.current.values()) {
+        answersBatch[item.questionId] = {
+          questionId: item.questionId,
+          answer: item.answer,
+          isDoubtful: item.isDoubtful,
+          updatedAt: item.updatedAt,
+        };
+      }
+      fetch(`/api/student/sessions/${sessionId}/answer`, {
+        method: 'POST',
+        keepalive: true,
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          answers: answersBatch,
+          currentQuestionIndex: currentIdxRef.current,
+        }),
+      }).catch(() => undefined);
+    };
+
+    window.addEventListener('pagehide', handlePageHide);
+
     return () => {
+      window.removeEventListener('pagehide', handlePageHide);
       unmountedRef.current = true;
       if (retryTimerRef.current !== null) {
         window.clearTimeout(retryTimerRef.current);
         retryTimerRef.current = null;
       }
     };
-  }, [clearDraftStorage, draftStorageKey, flushPendingAnswers, initialData.session.answers, initialData.session.status]);
+  }, [clearDraftStorage, draftStorageKey, flushPendingAnswers, initialData.session.answers, initialData.session.status, saveDraftToStorage, sessionId]);
 
   const currentQuestion = questions[currentIdx];
   const currentAnswer = currentQuestion ? answers[currentQuestion.id]?.answer || '' : '';
@@ -280,6 +334,21 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
     if (submitting || statusRef.current === 'SELESAI') return;
     setSubmitting(true);
     try {
+      const mergedSnapshot: Record<
+        string,
+        { questionId: string; answer: string; isDoubtful: boolean; updatedAt: string }
+      > = {};
+
+      for (const [qId, rec] of Object.entries(answersRef.current)) {
+        if (!rec) continue;
+        mergedSnapshot[qId] = {
+          questionId: qId,
+          answer: typeof rec.answer === 'string' ? rec.answer : '',
+          isDoubtful: Boolean(rec.isDoubtful),
+          updatedAt: rec.updatedAt || new Date().toISOString(),
+        };
+      }
+
       if (essayDebounceRef.current) {
         window.clearTimeout(essayDebounceRef.current);
         essayDebounceRef.current = null;
@@ -287,22 +356,38 @@ export const ExamRoom: React.FC<ExamRoomProps> = ({
         if (activeQ && activeQ.type === 'ESAI') {
           const rec = answersRef.current[activeQ.id];
           if (rec) {
+            const ts = rec.updatedAt || new Date().toISOString();
             pendingAnswersRef.current.set(activeQ.id, {
               questionId: activeQ.id,
               answer: rec.answer || '',
               isDoubtful: Boolean(rec.isDoubtful),
               idx: currentIdxRef.current,
-              updatedAt: rec.updatedAt || new Date().toISOString(),
+              updatedAt: ts,
             });
             saveDraftToStorage();
           }
         }
       }
-      if (pendingAnswersRef.current.size > 0) {
-        await flushPendingAnswers(2);
+
+      for (const item of pendingAnswersRef.current.values()) {
+        const prev = mergedSnapshot[item.questionId];
+        if (!prev || !prev.updatedAt || item.updatedAt >= prev.updatedAt) {
+          mergedSnapshot[item.questionId] = {
+            questionId: item.questionId,
+            answer: item.answer,
+            isDoubtful: item.isDoubtful,
+            updatedAt: item.updatedAt,
+          };
+        }
       }
+
+      if (pendingAnswersRef.current.size > 0) {
+        await flushPendingAnswers(1);
+      }
+
       const res = await apiFetch<FinishResponse>(`/api/student/sessions/${sessionId}/finish`, {
         method: 'POST',
+        body: JSON.stringify({ answers: mergedSnapshot }),
       });
       clearDraftStorage();
       setStatus('SELESAI');

@@ -20,7 +20,25 @@ import {
   store,
 } from './store.ts';
 import type { CbtDatabase, StoreContext } from './store.ts';
-import { classifyDbError, dbCheckHealth, dbPollEventsAfter, dbTouchPresence, getIsUsingPostgres } from './db.ts';
+import {
+  classifyDbError,
+  dbCheckHealth,
+  dbPgFindDocById,
+  dbPgFinishStudentSession,
+  dbPgGetPublicInfo,
+  dbPgGetStartExamContext,
+  dbPgGetStudentExamsContext,
+  dbPgGetStudentMaterialsContext,
+  dbPgInsertOrResumeSession,
+  dbPgMarkStaleSessionsOffline,
+  dbPgReportViolation,
+  dbPgSaveStudentAnswers,
+  dbPgStudentHeartbeat,
+  dbPgStudentLoginLookup,
+  dbPollEventsAfter,
+  dbTouchPresence,
+  getIsUsingPostgres,
+} from './db.ts';
 import type {
   AdminAccount,
   AttendanceMethod,
@@ -144,8 +162,78 @@ function reportDbUnavailable(context: string, err: unknown) {
   return info;
 }
 
-// Every API request runs against the store and writes back only changed documents
-// (plus queued realtime events) before responding.
+function isFastPathRoute(req: Request): boolean {
+  if (!getIsUsingPostgres()) {
+    return false;
+  }
+  const method = req.method.toUpperCase();
+  if (method === 'GET' && (req.path === '/public/info' || req.path === '/auth/me' || req.path === '/student/exams' || req.path === '/student/materials')) {
+    return true;
+  }
+  if (method === 'POST') {
+    if (req.path === '/auth/student/login' || req.path === '/events') {
+      return true;
+    }
+    if (/^\/student\/exams\/[^/]+\/start$/.test(req.path)) {
+      return true;
+    }
+    if (/^\/student\/sessions\/[^/]+\/(answer|violation|finish)$/.test(req.path)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function runWithStore(res: Response, fn: () => void | Promise<void>): Promise<void> {
+  let ctx: StoreContext;
+  try {
+    ctx = await store.load();
+  } catch (err) {
+    const info = reportDbUnavailable('store.load', err);
+    res.status(503).json({ error: info.userMessage, code: info.code, retryable: info.retryable });
+    return;
+  }
+
+  const originalSend = res.send.bind(res);
+  let flushed = false;
+  res.send = ((body?: unknown) => {
+    if (flushed) {
+      return originalSend(body);
+    }
+    flushed = true;
+    if (!ctx.dirty && ctx.events.length === 0) {
+      return originalSend(body);
+    }
+    store
+      .flush(ctx)
+      .then(() => originalSend(body))
+      .catch((err) => {
+        const info = reportDbUnavailable('store.flush', err);
+        if (!res.headersSent) {
+          res.status(info.retryable ? 500 : 503);
+          res.setHeader('Content-Type', 'application/json; charset=utf-8');
+          originalSend(
+            JSON.stringify({
+              error: info.retryable
+                ? `Perubahan gagal disimpan ke database (${info.code}). Silakan coba lagi.`
+                : info.userMessage,
+              code: info.code,
+              retryable: info.retryable,
+            })
+          );
+        }
+      });
+    return res;
+  }) as Response['send'];
+
+  await store.run(ctx, async () => {
+    await fn();
+  });
+}
+
+// Non-fast-path API requests run against the store and write back only changed documents
+// (plus queued realtime events) before responding. Student exam & login fast-paths bypass
+// full-store loading on PostgreSQL and use targeted/atomic per-document queries instead.
 app.use('/api', async (req: Request, res: Response, next: NextFunction) => {
   if (req.path === '/health' && req.method === 'GET') {
     next();
@@ -160,7 +248,7 @@ app.use('/api', async (req: Request, res: Response, next: NextFunction) => {
     return;
   }
 
-  if (req.path === '/events' && req.method === 'GET') {
+  if ((req.path === '/events' && req.method === 'GET') || isFastPathRoute(req)) {
     next();
     return;
   }
@@ -211,7 +299,7 @@ app.use('/api', async (req: Request, res: Response, next: NextFunction) => {
     if (now - lastMiddlewareMaintenanceAt >= MAINTENANCE_INTERVAL_MS) {
       lastMiddlewareMaintenanceAt = now;
       try {
-        runMaintenance();
+        runMaintenance({ skipSessionWrites: getIsUsingPostgres() });
       } catch (err) {
         console.error('Maintenance tick gagal:', err);
       }
@@ -448,37 +536,76 @@ app.get('/api/health', async (_req, res) => {
   });
 });
 
-app.get('/api/public/info', (_req, res) => {
-  const db = store.getDb();
-  res.json({
-    settings: {
-      schoolName: db.settings.schoolName,
-      npsn: db.settings.npsn,
-      address: db.settings.address,
-      academicYear: db.settings.academicYear,
-      semester: db.settings.semester,
-      serverName: db.settings.serverName,
-      maintenanceMode: db.settings.maintenanceMode,
-      themeColor: db.settings.themeColor || 'teal',
-      sidebarStyle: db.settings.sidebarStyle || 'dark',
-      schoolLogo: db.settings.schoolLogo || '',
-      portalSlides: Array.isArray(db.settings.portalSlides) ? db.settings.portalSlides : [],
-    },
-    adminSetupRequired: isAdminSetupRequired(),
-    sampleStudents: db.students.slice(0, 4).map((s) => ({
-      nis: s.nis,
-      name: s.name,
-      className: s.className,
-    })),
-    sampleTeachers: (db.teachers || [])
-      .filter((t) => t.isActive)
-      .slice(0, 4)
-      .map((t) => ({
-        nip: t.nip,
-        fullName: t.fullName,
-        subject: t.subject,
-      })),
-  });
+app.get('/api/public/info', async (_req, res, next) => {
+  try {
+    const pgInfo = await dbPgGetPublicInfo();
+    if (pgInfo) {
+      const s = pgInfo.settings as Partial<CbtDatabase['settings']>;
+      const envPass = process.env.ADMIN_PASSCODE?.trim();
+      res.json({
+        settings: {
+          schoolName: s.schoolName || '',
+          npsn: s.npsn || '',
+          address: s.address || '',
+          academicYear: s.academicYear || '',
+          semester: s.semester || '',
+          serverName: s.serverName || '',
+          maintenanceMode: Boolean(s.maintenanceMode),
+          themeColor: s.themeColor || 'teal',
+          sidebarStyle: s.sidebarStyle || 'dark',
+          schoolLogo: s.schoolLogo || '',
+          portalSlides: Array.isArray(s.portalSlides) ? s.portalSlides : [],
+        },
+        adminSetupRequired: !envPass && pgInfo.adminCount === 0,
+        sampleStudents: (pgInfo.sampleStudents as unknown as Student[]).map((st) => ({
+          nis: st.nis,
+          name: st.name,
+          className: st.className,
+        })),
+        sampleTeachers: (pgInfo.sampleTeachers as unknown as TeacherAccount[]).map((t) => ({
+          nip: t.nip,
+          fullName: t.fullName,
+          subject: t.subject,
+        })),
+      });
+      return;
+    }
+
+    await runWithStore(res, () => {
+      const db = store.getDb();
+      res.json({
+        settings: {
+          schoolName: db.settings.schoolName,
+          npsn: db.settings.npsn,
+          address: db.settings.address,
+          academicYear: db.settings.academicYear,
+          semester: db.settings.semester,
+          serverName: db.settings.serverName,
+          maintenanceMode: db.settings.maintenanceMode,
+          themeColor: db.settings.themeColor || 'teal',
+          sidebarStyle: db.settings.sidebarStyle || 'dark',
+          schoolLogo: db.settings.schoolLogo || '',
+          portalSlides: Array.isArray(db.settings.portalSlides) ? db.settings.portalSlides : [],
+        },
+        adminSetupRequired: isAdminSetupRequired(),
+        sampleStudents: db.students.slice(0, 4).map((s) => ({
+          nis: s.nis,
+          name: s.name,
+          className: s.className,
+        })),
+        sampleTeachers: (db.teachers || [])
+          .filter((t) => t.isActive)
+          .slice(0, 4)
+          .map((t) => ({
+            nip: t.nip,
+            fullName: t.fullName,
+            subject: t.subject,
+          })),
+      });
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
 app.post('/api/auth/admin/setup', (req, res) => {
@@ -579,43 +706,83 @@ app.post('/api/auth/admin/login', (req, res) => {
   });
 });
 
-app.post('/api/auth/student/login', (req, res) => {
-  const db = store.getDb();
-  if (db.settings.maintenanceMode) {
-    res.status(503).json({
-      error: 'Server CBT sedang dalam mode pemeliharaan oleh Proktor. Silakan tunggu beberapa saat.',
+app.post('/api/auth/student/login', async (req, res, next) => {
+  try {
+    const nis = typeof req.body?.nis === 'string' ? req.body.nis.trim() : '';
+    const password = typeof req.body?.password === 'string' ? req.body.password.trim() : '';
+
+    const pgLookup = await dbPgStudentLoginLookup(nis);
+    if (pgLookup) {
+      if (pgLookup.maintenanceMode) {
+        res.status(503).json({
+          error: 'Server CBT sedang dalam mode pemeliharaan oleh Proktor. Silakan tunggu beberapa saat.',
+        });
+        return;
+      }
+      const student = pgLookup.student as Student | null;
+      if (!student || String(student.password ?? '') !== password) {
+        res.status(401).json({ error: 'NIS atau Password peserta ujian salah.' });
+        return;
+      }
+      const token = signAuthToken({
+        sub: student.id,
+        role: 'student',
+        name: student.name,
+        identifier: student.nis,
+      });
+      res.json({
+        token,
+        user: {
+          id: student.id,
+          role: 'student',
+          name: student.name,
+          identifier: student.nis,
+          className: student.className,
+          room: student.room,
+          sessionGroup: student.sessionGroup,
+        },
+      });
+      return;
+    }
+
+    await runWithStore(res, () => {
+      const db = store.getDb();
+      if (db.settings.maintenanceMode) {
+        res.status(503).json({
+          error: 'Server CBT sedang dalam mode pemeliharaan oleh Proktor. Silakan tunggu beberapa saat.',
+        });
+        return;
+      }
+
+      const student = db.students.find((s) => s.nis === nis && s.password === password);
+      if (!student) {
+        res.status(401).json({ error: 'NIS atau Password peserta ujian salah.' });
+        return;
+      }
+
+      const token = signAuthToken({
+        sub: student.id,
+        role: 'student',
+        name: student.name,
+        identifier: student.nis,
+      });
+
+      res.json({
+        token,
+        user: {
+          id: student.id,
+          role: 'student',
+          name: student.name,
+          identifier: student.nis,
+          className: student.className,
+          room: student.room,
+          sessionGroup: student.sessionGroup,
+        },
+      });
     });
-    return;
+  } catch (err) {
+    next(err);
   }
-
-  const nis = typeof req.body?.nis === 'string' ? req.body.nis.trim() : '';
-  const password = typeof req.body?.password === 'string' ? req.body.password.trim() : '';
-
-  const student = db.students.find((s) => s.nis === nis && s.password === password);
-  if (!student) {
-    res.status(401).json({ error: 'NIS atau Password peserta ujian salah.' });
-    return;
-  }
-
-  const token = signAuthToken({
-    sub: student.id,
-    role: 'student',
-    name: student.name,
-    identifier: student.nis,
-  });
-
-  res.json({
-    token,
-    user: {
-      id: student.id,
-      role: 'student',
-      name: student.name,
-      identifier: student.nis,
-      className: student.className,
-      room: student.room,
-      sessionGroup: student.sessionGroup,
-    },
-  });
 });
 
 app.post('/api/auth/teacher/login', (req, res) => {
@@ -657,53 +824,113 @@ app.post('/api/auth/teacher/login', (req, res) => {
   });
 });
 
-app.get('/api/auth/me', requireAuth, (req: AuthenticatedRequest, res) => {
-  const user = req.user!;
-  const db = store.getDb();
-  if (user.role === 'student') {
-    const stu = db.students.find((s) => s.id === user.sub);
-    if (!stu) {
-      res.status(404).json({ error: 'Peserta tidak ditemukan.' });
-      return;
+app.get('/api/auth/me', requireAuth, async (req: AuthenticatedRequest, res, next) => {
+  try {
+    const user = req.user!;
+    if (getIsUsingPostgres()) {
+      if (user.role === 'student') {
+        const lookup = await dbPgFindDocById<Student>('students', user.sub);
+        if (lookup) {
+          if (!lookup.found) {
+            res.status(404).json({ error: 'Peserta tidak ditemukan.' });
+            return;
+          }
+          const stu = lookup.data;
+          res.json({
+            user: {
+              id: stu.id,
+              role: 'student',
+              name: stu.name,
+              identifier: stu.nis,
+              className: stu.className,
+              room: stu.room,
+              sessionGroup: stu.sessionGroup,
+            },
+          });
+          return;
+        }
+      } else if (user.role === 'guru') {
+        const lookup = await dbPgFindDocById<TeacherAccount>('teachers', user.sub);
+        if (lookup) {
+          if (!lookup.found || lookup.data.isActive === false) {
+            res.status(403).json({ error: 'Akun Guru tidak ditemukan atau telah dinonaktifkan.' });
+            return;
+          }
+          const teacher = lookup.data;
+          res.json({
+            user: {
+              id: teacher.id,
+              role: 'guru',
+              name: teacher.fullName,
+              identifier: teacher.nip,
+              subject: teacher.subject,
+            },
+          });
+          return;
+        }
+      } else {
+        res.json({
+          user: {
+            id: user.sub,
+            role: user.role,
+            name: user.name,
+            identifier: user.identifier,
+          },
+        });
+        return;
+      }
     }
-    res.json({
-      user: {
-        id: stu.id,
-        role: 'student',
-        name: stu.name,
-        identifier: stu.nis,
-        className: stu.className,
-        room: stu.room,
-        sessionGroup: stu.sessionGroup,
-      },
+
+    await runWithStore(res, () => {
+      const db = store.getDb();
+      if (user.role === 'student') {
+        const stu = db.students.find((s) => s.id === user.sub);
+        if (!stu) {
+          res.status(404).json({ error: 'Peserta tidak ditemukan.' });
+          return;
+        }
+        res.json({
+          user: {
+            id: stu.id,
+            role: 'student',
+            name: stu.name,
+            identifier: stu.nis,
+            className: stu.className,
+            room: stu.room,
+            sessionGroup: stu.sessionGroup,
+          },
+        });
+        return;
+      }
+      if (user.role === 'guru') {
+        const teacher = (db.teachers || []).find((t) => t.id === user.sub);
+        if (!teacher || !teacher.isActive) {
+          res.status(403).json({ error: 'Akun Guru tidak ditemukan atau telah dinonaktifkan.' });
+          return;
+        }
+        res.json({
+          user: {
+            id: teacher.id,
+            role: 'guru',
+            name: teacher.fullName,
+            identifier: teacher.nip,
+            subject: teacher.subject,
+          },
+        });
+        return;
+      }
+      res.json({
+        user: {
+          id: user.sub,
+          role: user.role,
+          name: user.name,
+          identifier: user.identifier,
+        },
+      });
     });
-    return;
+  } catch (err) {
+    next(err);
   }
-  if (user.role === 'guru') {
-    const teacher = (db.teachers || []).find((t) => t.id === user.sub);
-    if (!teacher || !teacher.isActive) {
-      res.status(403).json({ error: 'Akun Guru tidak ditemukan atau telah dinonaktifkan.' });
-      return;
-    }
-    res.json({
-      user: {
-        id: teacher.id,
-        role: 'guru',
-        name: teacher.fullName,
-        identifier: teacher.nip,
-        subject: teacher.subject,
-      },
-    });
-    return;
-  }
-  res.json({
-    user: {
-      id: user.sub,
-      role: user.role,
-      name: user.name,
-      identifier: user.identifier,
-    },
-  });
 });
 
 app.put('/api/teacher/profile', requireAuth, (req: AuthenticatedRequest, res) => {
@@ -778,364 +1005,829 @@ app.put('/api/teacher/profile', requireAuth, (req: AuthenticatedRequest, res) =>
 
 // ---------- STUDENT EXAM ROUTES ----------
 
-app.get('/api/student/exams', requireAuth, requireStudent, (req: AuthenticatedRequest, res) => {
-  const db = store.getDb();
-  const student = db.students.find((s) => s.id === req.user!.sub);
-  if (!student) {
-    res.status(404).json({ error: 'Data peserta tidak ditemukan.' });
-    return;
+type AnswerPatchItem = {
+  questionId: string;
+  answer: string;
+  isDoubtful: boolean;
+  updatedAt: string;
+};
+
+function parseAnswersPatch(body: unknown, nowIso: string): Record<string, AnswerPatchItem> {
+  const patch: Record<string, AnswerPatchItem> = {};
+  if (!body || typeof body !== 'object') {
+    return patch;
+  }
+  const obj = body as Record<string, unknown>;
+
+  const pushEntry = (fallbackQid: string, raw: unknown) => {
+    if (!raw || typeof raw !== 'object') return;
+    const item = raw as Record<string, unknown>;
+    const qId =
+      typeof item.questionId === 'string' && item.questionId.trim()
+        ? item.questionId.trim()
+        : fallbackQid;
+    if (!qId) return;
+    const rawTs = typeof item.updatedAt === 'string' && item.updatedAt.trim() ? item.updatedAt.trim() : '';
+    const updatedAt = rawTs && !Number.isNaN(Date.parse(rawTs)) ? rawTs : nowIso;
+    patch[qId] = {
+      questionId: qId,
+      answer: typeof item.answer === 'string' ? item.answer : '',
+      isDoubtful: Boolean(item.isDoubtful),
+      updatedAt,
+    };
+  };
+
+  if (Array.isArray(obj.answers)) {
+    for (const entry of obj.answers) {
+      pushEntry('', entry);
+    }
+  } else if (obj.answers && typeof obj.answers === 'object') {
+    for (const [k, entry] of Object.entries(obj.answers as Record<string, unknown>)) {
+      pushEntry(k, entry);
+    }
   }
 
-  const visibleExams = db.exams
-    .filter((ex) => ex.isActive && (ex.targetClasses.length === 0 || ex.targetClasses.includes(student.className)))
-    .map((ex) => {
-      const bank = db.banks.find((b) => b.id === ex.bankId);
-      const session = db.sessions.find((s) => s.examId === ex.id && s.studentId === student.id);
-      return {
-        id: ex.id,
-        title: ex.title,
-        subject: ex.subject,
-        bankCode: bank?.code || '-',
-        kkm: bank?.kkm ?? 75,
-        questionCount: bank?.questions.length ?? 0,
-        durationMinutes: ex.durationMinutes,
-        antiCheatEnabled: ex.antiCheatEnabled,
-        maxViolations: ex.maxViolations,
-        showScoreAfterFinish: ex.showScoreAfterFinish,
-        startDate: ex.startDate,
-        endDate: ex.endDate,
-        session: session
-          ? {
-              id: session.id,
-              status: session.status,
-              startedAt: session.startedAt,
-              endsAt: session.endsAt,
-              finishedAt: session.finishedAt,
-              violationCount: session.violationCount,
-              lastViolationReason: session.lastViolationReason,
-              finalScore: ex.showScoreAfterFinish && session.status === 'SELESAI' ? session.finalScore : undefined,
-              pgCorrect: ex.showScoreAfterFinish && session.status === 'SELESAI' ? session.pgCorrect : undefined,
-              pgTotal: ex.showScoreAfterFinish && session.status === 'SELESAI' ? session.pgTotal : undefined,
-            }
-          : null,
-      };
-    });
-
-  res.json({
-    exams: visibleExams,
-    broadcasts: db.broadcasts.slice(0, 5),
-    maintenanceMode: db.settings.maintenanceMode,
-  });
-});
-
-app.get('/api/student/materials', requireAuth, requireStudent, (req: AuthenticatedRequest, res) => {
-  const db = store.getDb();
-  const student = db.students.find((s) => s.id === req.user!.sub);
-  if (!student) {
-    res.status(404).json({ error: 'Data peserta tidak ditemukan.' });
-    return;
+  if (typeof obj.questionId === 'string' && obj.questionId.trim()) {
+    pushEntry(obj.questionId.trim(), obj);
   }
 
-  const materials = (db.materials || [])
-    .filter(
-      (m) =>
-        m.isPublished &&
-        (m.targetClasses.length === 0 || m.targetClasses.includes(student.className))
-    )
-    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  return patch;
+}
 
-  res.json({ materials });
-});
+function buildOptionOrdersForExam(
+  exam: ExamSchedule,
+  bank: QuestionBank
+): { questionIds: string[]; optionOrders: Record<string, ('A' | 'B' | 'C' | 'D' | 'E')[]> } {
+  const questionIds = exam.randomizeQuestions
+    ? shuffleArray(bank.questions.map((q) => q.id))
+    : bank.questions.map((q) => q.id);
 
-app.post('/api/student/exams/:examId/start', requireAuth, requireStudent, (req: AuthenticatedRequest, res) => {
-  const db = store.getDb();
-  if (db.settings.maintenanceMode) {
-    res.status(503).json({ error: 'Server sedang dalam mode pemeliharaan.' });
-    return;
+  const optionOrders: Record<string, ('A' | 'B' | 'C' | 'D' | 'E')[]> = {};
+  const baseKeys: ('A' | 'B' | 'C' | 'D' | 'E')[] = ['A', 'B', 'C', 'D', 'E'];
+  for (const q of bank.questions) {
+    if (q.type === 'PG') {
+      const availableKeys = baseKeys.filter((k) => {
+        const val =
+          k === 'A'
+            ? q.optionA
+            : k === 'B'
+              ? q.optionB
+              : k === 'C'
+                ? q.optionC
+                : k === 'D'
+                  ? q.optionD
+                  : q.optionE;
+        return val && val.trim().length > 0;
+      });
+      optionOrders[q.id] = exam.randomizeOptions ? shuffleArray(availableKeys) : availableKeys;
+    }
   }
+  return { questionIds, optionOrders };
+}
 
-  const student = db.students.find((s) => s.id === req.user!.sub);
-  const exam = db.exams.find((e) => e.id === req.params.examId);
-  if (!student || !exam || !exam.isActive) {
-    res.status(404).json({ error: 'Jadwal ujian tidak ditemukan atau belum diaktifkan.' });
-    return;
+function scoreSessionRecord(
+  sess: Record<string, unknown>,
+  bank: Record<string, unknown> | undefined
+): Record<string, unknown> {
+  return calculateSessionScore(
+    sess as unknown as ExamSession,
+    bank as unknown as QuestionBank | undefined
+  ) as unknown as Record<string, unknown>;
+}
+
+const lastAnswerEventEmitAt = new Map<string, number>();
+
+function shouldEmitAnswerAdminEvent(sessionId: string): boolean {
+  const now = Date.now();
+  const prev = lastAnswerEventEmitAt.get(sessionId) || 0;
+  if (now - prev < 3_000) {
+    return false;
   }
-  if (exam.targetClasses.length > 0 && !exam.targetClasses.includes(student.className)) {
-    res.status(403).json({ error: `Ujian ini tidak dijadwalkan untuk kelas Anda (${student.className}).` });
-    return;
+  lastAnswerEventEmitAt.set(sessionId, now);
+  if (lastAnswerEventEmitAt.size > 2000) {
+    for (const [k, ts] of lastAnswerEventEmitAt.entries()) {
+      if (now - ts > 120_000) {
+        lastAnswerEventEmitAt.delete(k);
+      }
+    }
   }
+  return true;
+}
 
-  const bank = db.banks.find((b) => b.id === exam.bankId);
-  if (!bank || bank.questions.length === 0) {
-    res.status(400).json({ error: 'Bank soal ujian ini belum memiliki butir soal.' });
-    return;
-  }
+app.get('/api/student/exams', requireAuth, requireStudent, async (req: AuthenticatedRequest, res, next) => {
+  try {
+    const pgCtx = await dbPgGetStudentExamsContext(req.user!.sub);
+    if (pgCtx) {
+      const student = pgCtx.student as Student | null;
+      if (!student) {
+        res.status(404).json({ error: 'Data peserta tidak ditemukan.' });
+        return;
+      }
+      const bankMetaMap = new Map(pgCtx.banksMeta.map((b) => [b.id, b]));
+      const sessionByExamId = new Map(
+        (pgCtx.sessions as unknown as ExamSession[]).map((s) => [s.examId, s])
+      );
+      const visibleExams = (pgCtx.exams as unknown as ExamSchedule[])
+        .filter(
+          (ex) =>
+            ex.isActive &&
+            (ex.targetClasses.length === 0 || ex.targetClasses.includes(student.className))
+        )
+        .map((ex) => {
+          const bankMeta = bankMetaMap.get(ex.bankId);
+          const session = sessionByExamId.get(ex.id);
+          return {
+            id: ex.id,
+            title: ex.title,
+            subject: ex.subject,
+            bankCode: bankMeta?.code || '-',
+            kkm: bankMeta?.kkm ?? 75,
+            questionCount: bankMeta?.questionCount ?? 0,
+            durationMinutes: ex.durationMinutes,
+            antiCheatEnabled: ex.antiCheatEnabled,
+            maxViolations: ex.maxViolations,
+            showScoreAfterFinish: ex.showScoreAfterFinish,
+            startDate: ex.startDate,
+            endDate: ex.endDate,
+            session: session
+              ? {
+                  id: session.id,
+                  status: session.status,
+                  startedAt: session.startedAt,
+                  endsAt: session.endsAt,
+                  finishedAt: session.finishedAt,
+                  violationCount: session.violationCount,
+                  lastViolationReason: session.lastViolationReason,
+                  finalScore:
+                    ex.showScoreAfterFinish && session.status === 'SELESAI' ? session.finalScore : undefined,
+                  pgCorrect:
+                    ex.showScoreAfterFinish && session.status === 'SELESAI' ? session.pgCorrect : undefined,
+                  pgTotal:
+                    ex.showScoreAfterFinish && session.status === 'SELESAI' ? session.pgTotal : undefined,
+                }
+              : null,
+          };
+        });
 
-  let session = db.sessions.find((s) => s.examId === exam.id && s.studentId === student.id);
-
-  if (session && session.status === 'SELESAI') {
-    res.status(409).json({ error: 'Anda sudah menyelesaikan ujian ini.' });
-    return;
-  }
-
-  if (!session) {
-    const inputToken = typeof req.body?.token === 'string' ? req.body.token.trim().toUpperCase() : '';
-    if (!inputToken || inputToken !== exam.token.toUpperCase()) {
-      res.status(400).json({ error: 'Token Ujian tidak sesuai. Periksa token terbaru dari Proktor.' });
+      res.json({
+        exams: visibleExams,
+        broadcasts: pgCtx.broadcasts,
+        maintenanceMode: pgCtx.maintenanceMode,
+      });
       return;
     }
 
-    const questionIds = exam.randomizeQuestions
-      ? shuffleArray(bank.questions.map((q) => q.id))
-      : bank.questions.map((q) => q.id);
+    await runWithStore(res, () => {
+      const db = store.getDb();
+      const student = db.students.find((s) => s.id === req.user!.sub);
+      if (!student) {
+        res.status(404).json({ error: 'Data peserta tidak ditemukan.' });
+        return;
+      }
 
-    const optionOrders: Record<string, ('A' | 'B' | 'C' | 'D' | 'E')[]> = {};
-    const baseKeys: ('A' | 'B' | 'C' | 'D' | 'E')[] = ['A', 'B', 'C', 'D', 'E'];
-    for (const q of bank.questions) {
-      if (q.type === 'PG') {
-        const availableKeys = baseKeys.filter((k) => {
-          const val =
-            k === 'A'
-              ? q.optionA
-              : k === 'B'
-                ? q.optionB
-                : k === 'C'
-                  ? q.optionC
-                  : k === 'D'
-                    ? q.optionD
-                    : q.optionE;
-          return val && val.trim().length > 0;
+      const visibleExams = db.exams
+        .filter(
+          (ex) =>
+            ex.isActive &&
+            (ex.targetClasses.length === 0 || ex.targetClasses.includes(student.className))
+        )
+        .map((ex) => {
+          const bank = db.banks.find((b) => b.id === ex.bankId);
+          const session = db.sessions.find((s) => s.examId === ex.id && s.studentId === student.id);
+          return {
+            id: ex.id,
+            title: ex.title,
+            subject: ex.subject,
+            bankCode: bank?.code || '-',
+            kkm: bank?.kkm ?? 75,
+            questionCount: bank?.questions.length ?? 0,
+            durationMinutes: ex.durationMinutes,
+            antiCheatEnabled: ex.antiCheatEnabled,
+            maxViolations: ex.maxViolations,
+            showScoreAfterFinish: ex.showScoreAfterFinish,
+            startDate: ex.startDate,
+            endDate: ex.endDate,
+            session: session
+              ? {
+                  id: session.id,
+                  status: session.status,
+                  startedAt: session.startedAt,
+                  endsAt: session.endsAt,
+                  finishedAt: session.finishedAt,
+                  violationCount: session.violationCount,
+                  lastViolationReason: session.lastViolationReason,
+                  finalScore:
+                    ex.showScoreAfterFinish && session.status === 'SELESAI' ? session.finalScore : undefined,
+                  pgCorrect:
+                    ex.showScoreAfterFinish && session.status === 'SELESAI' ? session.pgCorrect : undefined,
+                  pgTotal:
+                    ex.showScoreAfterFinish && session.status === 'SELESAI' ? session.pgTotal : undefined,
+                }
+              : null,
+          };
         });
-        optionOrders[q.id] = exam.randomizeOptions ? shuffleArray(availableKeys) : availableKeys;
+
+      res.json({
+        exams: visibleExams,
+        broadcasts: db.broadcasts.slice(0, 5),
+        maintenanceMode: db.settings.maintenanceMode,
+      });
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.get('/api/student/materials', requireAuth, requireStudent, async (req: AuthenticatedRequest, res, next) => {
+  try {
+    const pgCtx = await dbPgGetStudentMaterialsContext(req.user!.sub);
+    if (pgCtx) {
+      const student = pgCtx.student as Student | null;
+      if (!student) {
+        res.status(404).json({ error: 'Data peserta tidak ditemukan.' });
+        return;
+      }
+      const materials = (pgCtx.materials as unknown as LearningMaterial[])
+        .filter(
+          (m) =>
+            m.isPublished &&
+            (m.targetClasses.length === 0 || m.targetClasses.includes(student.className))
+        )
+        .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+      res.json({ materials });
+      return;
+    }
+
+    await runWithStore(res, () => {
+      const db = store.getDb();
+      const student = db.students.find((s) => s.id === req.user!.sub);
+      if (!student) {
+        res.status(404).json({ error: 'Data peserta tidak ditemukan.' });
+        return;
+      }
+
+      const materials = (db.materials || [])
+        .filter(
+          (m) =>
+            m.isPublished &&
+            (m.targetClasses.length === 0 || m.targetClasses.includes(student.className))
+        )
+        .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+
+      res.json({ materials });
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/api/student/exams/:examId/start', requireAuth, requireStudent, async (req: AuthenticatedRequest, res, next) => {
+  try {
+    const pgCtx = await dbPgGetStartExamContext(req.user!.sub, req.params.examId);
+    if (pgCtx) {
+      if (pgCtx.maintenanceMode) {
+        res.status(503).json({ error: 'Server sedang dalam mode pemeliharaan.' });
+        return;
+      }
+      const student = pgCtx.student as Student | null;
+      const exam = pgCtx.exam as ExamSchedule | null;
+      if (!student || !exam || !exam.isActive) {
+        res.status(404).json({ error: 'Jadwal ujian tidak ditemukan atau belum diaktifkan.' });
+        return;
+      }
+      if (exam.targetClasses.length > 0 && !exam.targetClasses.includes(student.className)) {
+        res.status(403).json({ error: `Ujian ini tidak dijadwalkan untuk kelas Anda (${student.className}).` });
+        return;
+      }
+      const bank = pgCtx.bank as QuestionBank | null;
+      if (!bank || !Array.isArray(bank.questions) || bank.questions.length === 0) {
+        res.status(400).json({ error: 'Bank soal ujian ini belum memiliki butir soal.' });
+        return;
+      }
+
+      const existingSession = pgCtx.session as ExamSession | null;
+      if (existingSession && existingSession.status === 'SELESAI') {
+        res.status(409).json({ error: 'Anda sudah menyelesaikan ujian ini.' });
+        return;
+      }
+
+      const nowMs = Date.now();
+      const nowIso = new Date(nowMs).toISOString();
+      let persisted: { session: Record<string, unknown>; version: number | null } | null = null;
+
+      if (!existingSession) {
+        const inputToken = typeof req.body?.token === 'string' ? req.body.token.trim().toUpperCase() : '';
+        if (!inputToken || inputToken !== exam.token.toUpperCase()) {
+          res.status(400).json({ error: 'Token Ujian tidak sesuai. Periksa token terbaru dari Proktor.' });
+          return;
+        }
+        const { questionIds, optionOrders } = buildOptionOrdersForExam(exam, bank);
+        const endsAtMs = nowMs + exam.durationMinutes * 60 * 1000;
+        const newSession: ExamSession = {
+          id: `sess-${crypto.randomUUID()}`,
+          examId: exam.id,
+          studentId: student.id,
+          studentNis: student.nis,
+          studentName: student.name,
+          className: student.className,
+          room: student.room,
+          status: 'SEDANG_UJIAN',
+          questionOrder: questionIds,
+          optionOrders,
+          answers: {},
+          currentQuestionIndex: 0,
+          startedAt: nowIso,
+          endsAt: new Date(endsAtMs).toISOString(),
+          extraMinutes: 0,
+          violationCount: 0,
+          pgCorrect: 0,
+          pgTotal: bank.questions.filter((q) => q.type === 'PG').length,
+          pgScore: 0,
+          essayScore: 0,
+          finalScore: 0,
+          isOnline: true,
+          lastHeartbeatAt: nowIso,
+        };
+        persisted = await dbPgInsertOrResumeSession({
+          newSession: newSession as unknown as Record<string, unknown>,
+          studentId: student.id,
+          examId: exam.id,
+          nowIso,
+        });
+      } else {
+        persisted = await dbPgInsertOrResumeSession({
+          resumeSessionId: existingSession.id,
+          studentId: student.id,
+          examId: exam.id,
+          nowIso,
+        });
+      }
+
+      if (persisted) {
+        const session = persisted.session as unknown as ExamSession;
+        if (session.status === 'SELESAI') {
+          res.status(409).json({ error: 'Anda sudah menyelesaikan ujian ini.' });
+          return;
+        }
+        store.syncCachedSession(session, persisted.version);
+        res.json({
+          session: {
+            id: session.id,
+            examId: session.examId,
+            status: session.status,
+            answers: session.answers || {},
+            currentQuestionIndex: session.currentQuestionIndex || 0,
+            startedAt: session.startedAt,
+            endsAt: session.endsAt,
+            violationCount: session.violationCount || 0,
+            lastViolationReason: session.lastViolationReason,
+          },
+          exam: {
+            id: exam.id,
+            title: exam.title,
+            subject: exam.subject,
+            durationMinutes: exam.durationMinutes,
+            antiCheatEnabled: exam.antiCheatEnabled,
+            maxViolations: exam.maxViolations,
+            showScoreAfterFinish: exam.showScoreAfterFinish,
+          },
+          questions: buildSanitizedQuestions(session, bank),
+        });
+        return;
       }
     }
 
-    const nowMs = Date.now();
-    const endsAtMs = nowMs + exam.durationMinutes * 60 * 1000;
+    await runWithStore(res, () => {
+      const db = store.getDb();
+      if (db.settings.maintenanceMode) {
+        res.status(503).json({ error: 'Server sedang dalam mode pemeliharaan.' });
+        return;
+      }
 
-    session = {
-      id: `sess-${crypto.randomUUID()}`,
-      examId: exam.id,
-      studentId: student.id,
-      studentNis: student.nis,
-      studentName: student.name,
-      className: student.className,
-      room: student.room,
-      status: 'SEDANG_UJIAN',
-      questionOrder: questionIds,
-      optionOrders,
-      answers: {},
-      currentQuestionIndex: 0,
-      startedAt: new Date(nowMs).toISOString(),
-      endsAt: new Date(endsAtMs).toISOString(),
-      extraMinutes: 0,
-      violationCount: 0,
-      pgCorrect: 0,
-      pgTotal: bank.questions.filter((q) => q.type === 'PG').length,
-      pgScore: 0,
-      essayScore: 0,
-      finalScore: 0,
-      isOnline: true,
-      lastHeartbeatAt: new Date(nowMs).toISOString(),
-    };
+      const student = db.students.find((s) => s.id === req.user!.sub);
+      const exam = db.exams.find((e) => e.id === req.params.examId);
+      if (!student || !exam || !exam.isActive) {
+        res.status(404).json({ error: 'Jadwal ujian tidak ditemukan atau belum diaktifkan.' });
+        return;
+      }
+      if (exam.targetClasses.length > 0 && !exam.targetClasses.includes(student.className)) {
+        res.status(403).json({ error: `Ujian ini tidak dijadwalkan untuk kelas Anda (${student.className}).` });
+        return;
+      }
 
-    db.sessions.push(session);
-    store.commit();
-    sendToAdmins('session:updated', session);
-  } else {
-    session.isOnline = true;
-    session.lastHeartbeatAt = new Date().toISOString();
-    store.commit();
-    sendToAdmins('session:updated', session);
-  }
+      const bank = db.banks.find((b) => b.id === exam.bankId);
+      if (!bank || bank.questions.length === 0) {
+        res.status(400).json({ error: 'Bank soal ujian ini belum memiliki butir soal.' });
+        return;
+      }
 
-  res.json({
-    session: {
-      id: session.id,
-      examId: session.examId,
-      status: session.status,
-      answers: session.answers,
-      currentQuestionIndex: session.currentQuestionIndex,
-      startedAt: session.startedAt,
-      endsAt: session.endsAt,
-      violationCount: session.violationCount,
-      lastViolationReason: session.lastViolationReason,
-    },
-    exam: {
-      id: exam.id,
-      title: exam.title,
-      subject: exam.subject,
-      durationMinutes: exam.durationMinutes,
-      antiCheatEnabled: exam.antiCheatEnabled,
-      maxViolations: exam.maxViolations,
-      showScoreAfterFinish: exam.showScoreAfterFinish,
-    },
-    questions: buildSanitizedQuestions(session, bank),
-  });
-});
+      let session = db.sessions.find((s) => s.examId === exam.id && s.studentId === student.id);
 
-app.post('/api/student/sessions/:sessionId/answer', requireAuth, requireStudent, (req: AuthenticatedRequest, res) => {
-  const db = store.getDb();
-  const session = db.sessions.find(
-    (s) => s.id === req.params.sessionId && s.studentId === req.user!.sub
-  );
-  if (!session) {
-    res.status(404).json({ error: 'Sesi ujian tidak ditemukan.' });
-    return;
-  }
-  if (session.status !== 'SEDANG_UJIAN') {
-    res.status(409).json({ error: `Tidak dapat menyimpan jawaban karena status ujian: ${session.status}` });
-    return;
-  }
+      if (session && session.status === 'SELESAI') {
+        res.status(409).json({ error: 'Anda sudah menyelesaikan ujian ini.' });
+        return;
+      }
 
-  const questionId = typeof req.body?.questionId === 'string' ? req.body.questionId : '';
-  const answer = typeof req.body?.answer === 'string' ? req.body.answer : '';
-  const isDoubtful = Boolean(req.body?.isDoubtful);
-  const currentQuestionIndex =
-    typeof req.body?.currentQuestionIndex === 'number'
-      ? req.body.currentQuestionIndex
-      : session.currentQuestionIndex;
-
-  if (!questionId || !session.questionOrder.includes(questionId)) {
-    res.status(400).json({ error: 'ID soal tidak valid.' });
-    return;
-  }
-
-  session.answers[questionId] = {
-    questionId,
-    answer,
-    isDoubtful,
-    updatedAt: new Date().toISOString(),
-  };
-  session.currentQuestionIndex = currentQuestionIndex;
-  session.isOnline = true;
-  session.lastHeartbeatAt = new Date().toISOString();
-  store.commit();
-
-  sendToAdmins('session:updated', session);
-  res.json({ ok: true, savedAt: session.answers[questionId].updatedAt });
-});
-
-app.post('/api/student/sessions/:sessionId/violation', requireAuth, requireStudent, (req: AuthenticatedRequest, res) => {
-  const db = store.getDb();
-  const session = db.sessions.find(
-    (s) => s.id === req.params.sessionId && s.studentId === req.user!.sub
-  );
-  if (!session) {
-    res.status(404).json({ error: 'Sesi ujian tidak ditemukan.' });
-    return;
-  }
-  if (session.status === 'SELESAI') {
-    res.json({ status: session.status, violationCount: session.violationCount, triggeredBlock: false });
-    return;
-  }
-
-  const exam = db.exams.find((e) => e.id === session.examId);
-  if (!exam || !exam.antiCheatEnabled) {
-    res.json({ status: session.status, violationCount: session.violationCount, triggeredBlock: false });
-    return;
-  }
-
-  const allowedTypes: ViolationType[] = [
-    'TAB_SWITCH',
-    'WINDOW_BLUR',
-    'EXIT_FULLSCREEN',
-    'COPY_PASTE',
-    'CONTEXT_MENU',
-    'DEVTOOLS_SHORTCUT',
-  ];
-  const rawType = typeof req.body?.type === 'string' ? req.body.type : 'TAB_SWITCH';
-  const type: ViolationType = allowedTypes.includes(rawType as ViolationType)
-    ? (rawType as ViolationType)
-    : 'TAB_SWITCH';
-  const description =
-    typeof req.body?.description === 'string' && req.body.description.trim()
-      ? req.body.description.trim().slice(0, 240)
-      : 'Aktivitas mencurigakan terdeteksi di luar jendela ujian';
-
-  session.violationCount += 1;
-  session.lastViolationReason = description;
-  const triggeredBlock = session.violationCount >= exam.maxViolations;
-
-  if (triggeredBlock) {
-    session.status = 'TERBLOKIR';
-    session.blockedAt = new Date().toISOString();
-  }
-
-  const logEntry: ViolationLog = {
-    id: `viol-${crypto.randomUUID()}`,
-    sessionId: session.id,
-    examId: exam.id,
-    examTitle: exam.title,
-    studentId: session.studentId,
-    studentNis: session.studentNis,
-    studentName: session.studentName,
-    className: session.className,
-    room: session.room,
-    type,
-    description,
-    countAtTime: session.violationCount,
-    triggeredBlock,
-    timestamp: new Date().toISOString(),
-  };
-
-  db.violations.unshift(logEntry);
-  if (db.violations.length > 500) {
-    db.violations = db.violations.slice(0, 500);
-  }
-  store.commit();
-
-  sendToAdmins('violation:logged', logEntry);
-  sendToAdmins('session:updated', session);
-
-  res.json({
-    status: session.status,
-    violationCount: session.violationCount,
-    maxViolations: exam.maxViolations,
-    triggeredBlock,
-    lastViolationReason: session.lastViolationReason,
-  });
-});
-
-app.post('/api/student/sessions/:sessionId/finish', requireAuth, requireStudent, (req: AuthenticatedRequest, res) => {
-  const db = store.getDb();
-  const session = db.sessions.find(
-    (s) => s.id === req.params.sessionId && s.studentId === req.user!.sub
-  );
-  if (!session) {
-    res.status(404).json({ error: 'Sesi ujian tidak ditemukan.' });
-    return;
-  }
-
-  const exam = db.exams.find((e) => e.id === session.examId);
-  const bank = exam ? db.banks.find((b) => b.id === exam.bankId) : undefined;
-
-  if (session.status !== 'SELESAI') {
-    session.status = 'SELESAI';
-    session.finishedAt = new Date().toISOString();
-    session.isOnline = false;
-    calculateSessionScore(session, bank);
-    store.commit();
-
-    sendToAdmins('session:updated', session);
-    sendToAdmins('sync:results', { sessionId: session.id, examId: session.examId });
-  }
-
-  res.json({
-    status: session.status,
-    finishedAt: session.finishedAt,
-    showScoreAfterFinish: exam?.showScoreAfterFinish ?? true,
-    result: exam?.showScoreAfterFinish
-      ? {
-          pgCorrect: session.pgCorrect,
-          pgTotal: session.pgTotal,
-          pgScore: session.pgScore,
-          finalScore: session.finalScore,
-          kkm: bank?.kkm ?? 75,
-          hasEssay: (bank?.questions.filter((q) => q.type === 'ESAI').length ?? 0) > 0,
+      if (!session) {
+        const inputToken = typeof req.body?.token === 'string' ? req.body.token.trim().toUpperCase() : '';
+        if (!inputToken || inputToken !== exam.token.toUpperCase()) {
+          res.status(400).json({ error: 'Token Ujian tidak sesuai. Periksa token terbaru dari Proktor.' });
+          return;
         }
-      : null,
-  });
+
+        const { questionIds, optionOrders } = buildOptionOrdersForExam(exam, bank);
+        const nowMs = Date.now();
+        const endsAtMs = nowMs + exam.durationMinutes * 60 * 1000;
+
+        session = {
+          id: `sess-${crypto.randomUUID()}`,
+          examId: exam.id,
+          studentId: student.id,
+          studentNis: student.nis,
+          studentName: student.name,
+          className: student.className,
+          room: student.room,
+          status: 'SEDANG_UJIAN',
+          questionOrder: questionIds,
+          optionOrders,
+          answers: {},
+          currentQuestionIndex: 0,
+          startedAt: new Date(nowMs).toISOString(),
+          endsAt: new Date(endsAtMs).toISOString(),
+          extraMinutes: 0,
+          violationCount: 0,
+          pgCorrect: 0,
+          pgTotal: bank.questions.filter((q) => q.type === 'PG').length,
+          pgScore: 0,
+          essayScore: 0,
+          finalScore: 0,
+          isOnline: true,
+          lastHeartbeatAt: new Date(nowMs).toISOString(),
+        };
+
+        db.sessions.push(session);
+        store.commit();
+        sendToAdmins('session:updated', session);
+      } else {
+        session.isOnline = true;
+        session.lastHeartbeatAt = new Date().toISOString();
+        store.commit();
+        sendToAdmins('session:updated', session);
+      }
+
+      res.json({
+        session: {
+          id: session.id,
+          examId: session.examId,
+          status: session.status,
+          answers: session.answers,
+          currentQuestionIndex: session.currentQuestionIndex,
+          startedAt: session.startedAt,
+          endsAt: session.endsAt,
+          violationCount: session.violationCount,
+          lastViolationReason: session.lastViolationReason,
+        },
+        exam: {
+          id: exam.id,
+          title: exam.title,
+          subject: exam.subject,
+          durationMinutes: exam.durationMinutes,
+          antiCheatEnabled: exam.antiCheatEnabled,
+          maxViolations: exam.maxViolations,
+          showScoreAfterFinish: exam.showScoreAfterFinish,
+        },
+        questions: buildSanitizedQuestions(session, bank),
+      });
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/api/student/sessions/:sessionId/answer', requireAuth, requireStudent, async (req: AuthenticatedRequest, res, next) => {
+  try {
+    const nowIso = new Date().toISOString();
+    const answersPatch = parseAnswersPatch(req.body, nowIso);
+    const patchKeys = Object.keys(answersPatch);
+    if (patchKeys.length === 0) {
+      res.status(400).json({ error: 'ID soal tidak valid.' });
+      return;
+    }
+
+    const currentQuestionIndex =
+      typeof req.body?.currentQuestionIndex === 'number' && Number.isFinite(req.body.currentQuestionIndex)
+        ? Math.max(0, Math.floor(req.body.currentQuestionIndex))
+        : undefined;
+
+    const emitAdmin = shouldEmitAnswerAdminEvent(req.params.sessionId);
+
+    const pgResult = await dbPgSaveStudentAnswers({
+      sessionId: req.params.sessionId,
+      studentId: req.user!.sub,
+      answersPatch,
+      currentQuestionIndex,
+      nowIso,
+      emitAdminEvent: emitAdmin,
+    });
+
+    if (pgResult) {
+      if (pgResult.kind === 'not_found') {
+        res.status(404).json({ error: 'Sesi ujian tidak ditemukan.' });
+        return;
+      }
+      if (pgResult.kind === 'conflict') {
+        res.status(409).json({
+          error: `Tidak dapat menyimpan jawaban karena status ujian: ${pgResult.status}`,
+        });
+        return;
+      }
+      if (pgResult.kind === 'invalid_question') {
+        res.status(400).json({ error: 'ID soal tidak valid.' });
+        return;
+      }
+      store.syncCachedSession(pgResult.session as unknown as ExamSession, pgResult.version);
+      res.json({ ok: true, savedAt: nowIso, savedIds: patchKeys });
+      return;
+    }
+
+    await runWithStore(res, () => {
+      const db = store.getDb();
+      const session = db.sessions.find(
+        (s) => s.id === req.params.sessionId && s.studentId === req.user!.sub
+      );
+      if (!session) {
+        res.status(404).json({ error: 'Sesi ujian tidak ditemukan.' });
+        return;
+      }
+      if (session.status !== 'SEDANG_UJIAN') {
+        res.status(409).json({ error: `Tidak dapat menyimpan jawaban karena status ujian: ${session.status}` });
+        return;
+      }
+
+      const validEntries = Object.values(answersPatch).filter((entry) =>
+        session.questionOrder.includes(entry.questionId)
+      );
+      if (validEntries.length === 0) {
+        res.status(400).json({ error: 'ID soal tidak valid.' });
+        return;
+      }
+
+      for (const entry of validEntries) {
+        const prev = session.answers[entry.questionId];
+        if (!prev?.updatedAt || entry.updatedAt >= prev.updatedAt) {
+          session.answers[entry.questionId] = {
+            questionId: entry.questionId,
+            answer: entry.answer,
+            isDoubtful: entry.isDoubtful,
+            updatedAt: entry.updatedAt,
+          };
+        }
+      }
+      if (currentQuestionIndex !== undefined) {
+        session.currentQuestionIndex = currentQuestionIndex;
+      }
+      session.isOnline = true;
+      session.lastHeartbeatAt = nowIso;
+      store.commit();
+
+      if (emitAdmin) {
+        sendToAdmins('session:updated', session);
+      }
+      res.json({
+        ok: true,
+        savedAt: nowIso,
+        savedIds: validEntries.map((e) => e.questionId),
+      });
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/api/student/sessions/:sessionId/violation', requireAuth, requireStudent, async (req: AuthenticatedRequest, res, next) => {
+  try {
+    const allowedTypes: ViolationType[] = [
+      'TAB_SWITCH',
+      'WINDOW_BLUR',
+      'EXIT_FULLSCREEN',
+      'COPY_PASTE',
+      'CONTEXT_MENU',
+      'DEVTOOLS_SHORTCUT',
+    ];
+    const rawType = typeof req.body?.type === 'string' ? req.body.type : 'TAB_SWITCH';
+    const type: ViolationType = allowedTypes.includes(rawType as ViolationType)
+      ? (rawType as ViolationType)
+      : 'TAB_SWITCH';
+    const description =
+      typeof req.body?.description === 'string' && req.body.description.trim()
+        ? req.body.description.trim().slice(0, 240)
+        : 'Aktivitas mencurigakan terdeteksi di luar jendela ujian';
+    const nowIso = new Date().toISOString();
+    const violationId = `viol-${crypto.randomUUID()}`;
+
+    const pgResult = await dbPgReportViolation({
+      sessionId: req.params.sessionId,
+      studentId: req.user!.sub,
+      type,
+      description,
+      violationId,
+      nowIso,
+    });
+
+    if (pgResult) {
+      if (pgResult.kind === 'not_found') {
+        res.status(404).json({ error: 'Sesi ujian tidak ditemukan.' });
+        return;
+      }
+      if (pgResult.kind === 'skipped') {
+        res.json({
+          status: pgResult.status,
+          violationCount: pgResult.violationCount,
+          triggeredBlock: false,
+        });
+        return;
+      }
+      const sess = pgResult.session as unknown as ExamSession;
+      const viol = pgResult.violation as unknown as ViolationLog;
+      store.syncCachedSession(sess, pgResult.version);
+      store.syncCachedViolation(viol, pgResult.version);
+      res.json({
+        status: sess.status,
+        violationCount: sess.violationCount,
+        maxViolations: pgResult.maxViolations,
+        triggeredBlock: pgResult.triggeredBlock,
+        lastViolationReason: sess.lastViolationReason,
+      });
+      return;
+    }
+
+    await runWithStore(res, () => {
+      const db = store.getDb();
+      const session = db.sessions.find(
+        (s) => s.id === req.params.sessionId && s.studentId === req.user!.sub
+      );
+      if (!session) {
+        res.status(404).json({ error: 'Sesi ujian tidak ditemukan.' });
+        return;
+      }
+      if (session.status === 'SELESAI') {
+        res.json({ status: session.status, violationCount: session.violationCount, triggeredBlock: false });
+        return;
+      }
+
+      const exam = db.exams.find((e) => e.id === session.examId);
+      if (!exam || !exam.antiCheatEnabled) {
+        res.json({ status: session.status, violationCount: session.violationCount, triggeredBlock: false });
+        return;
+      }
+
+      session.violationCount += 1;
+      session.lastViolationReason = description;
+      const triggeredBlock = session.violationCount >= exam.maxViolations;
+
+      if (triggeredBlock) {
+        session.status = 'TERBLOKIR';
+        session.blockedAt = nowIso;
+      }
+
+      const logEntry: ViolationLog = {
+        id: violationId,
+        sessionId: session.id,
+        examId: exam.id,
+        examTitle: exam.title,
+        studentId: session.studentId,
+        studentNis: session.studentNis,
+        studentName: session.studentName,
+        className: session.className,
+        room: session.room,
+        type,
+        description,
+        countAtTime: session.violationCount,
+        triggeredBlock,
+        timestamp: nowIso,
+      };
+
+      db.violations.unshift(logEntry);
+      if (db.violations.length > 500) {
+        db.violations = db.violations.slice(0, 500);
+      }
+      store.commit();
+
+      sendToAdmins('violation:logged', logEntry);
+      sendToAdmins('session:updated', session);
+
+      res.json({
+        status: session.status,
+        violationCount: session.violationCount,
+        maxViolations: exam.maxViolations,
+        triggeredBlock,
+        lastViolationReason: session.lastViolationReason,
+      });
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.post('/api/student/sessions/:sessionId/finish', requireAuth, requireStudent, async (req: AuthenticatedRequest, res, next) => {
+  try {
+    const nowIso = new Date().toISOString();
+    const parsedPatch = parseAnswersPatch(req.body, nowIso);
+    const clientAnswersPatch = Object.keys(parsedPatch).length > 0 ? parsedPatch : null;
+
+    const pgResult = await dbPgFinishStudentSession({
+      sessionId: req.params.sessionId,
+      studentId: req.user!.sub,
+      clientAnswersPatch,
+      nowIso,
+      scoreSession: scoreSessionRecord,
+    });
+
+    if (pgResult) {
+      if (pgResult.kind === 'not_found') {
+        res.status(404).json({ error: 'Sesi ujian tidak ditemukan.' });
+        return;
+      }
+      const session = pgResult.session as unknown as ExamSession;
+      const exam = pgResult.exam as unknown as ExamSchedule | undefined;
+      const bank = pgResult.bank as unknown as QuestionBank | undefined;
+      store.syncCachedSession(session, pgResult.version);
+
+      res.json({
+        status: session.status,
+        finishedAt: session.finishedAt,
+        showScoreAfterFinish: exam?.showScoreAfterFinish ?? true,
+        result: exam?.showScoreAfterFinish
+          ? {
+              pgCorrect: session.pgCorrect,
+              pgTotal: session.pgTotal,
+              pgScore: session.pgScore,
+              finalScore: session.finalScore,
+              kkm: bank?.kkm ?? 75,
+              hasEssay: (bank?.questions?.filter((q) => q.type === 'ESAI').length ?? 0) > 0,
+            }
+          : null,
+      });
+      return;
+    }
+
+    await runWithStore(res, () => {
+      const db = store.getDb();
+      const session = db.sessions.find(
+        (s) => s.id === req.params.sessionId && s.studentId === req.user!.sub
+      );
+      if (!session) {
+        res.status(404).json({ error: 'Sesi ujian tidak ditemukan.' });
+        return;
+      }
+
+      const exam = db.exams.find((e) => e.id === session.examId);
+      const bank = exam ? db.banks.find((b) => b.id === exam.bankId) : undefined;
+
+      if (session.status !== 'SELESAI') {
+        if (clientAnswersPatch && session.status === 'SEDANG_UJIAN') {
+          for (const entry of Object.values(clientAnswersPatch)) {
+            if (!session.questionOrder.includes(entry.questionId)) continue;
+            const prev = session.answers[entry.questionId];
+            if (!prev?.updatedAt || entry.updatedAt >= prev.updatedAt) {
+              session.answers[entry.questionId] = {
+                questionId: entry.questionId,
+                answer: entry.answer,
+                isDoubtful: entry.isDoubtful,
+                updatedAt: entry.updatedAt,
+              };
+            }
+          }
+        }
+        session.status = 'SELESAI';
+        session.finishedAt = nowIso;
+        session.isOnline = false;
+        calculateSessionScore(session, bank);
+        store.commit();
+
+        sendToAdmins('session:updated', session);
+        sendToAdmins('sync:results', { sessionId: session.id, examId: session.examId });
+      }
+
+      res.json({
+        status: session.status,
+        finishedAt: session.finishedAt,
+        showScoreAfterFinish: exam?.showScoreAfterFinish ?? true,
+        result: exam?.showScoreAfterFinish
+          ? {
+              pgCorrect: session.pgCorrect,
+              pgTotal: session.pgTotal,
+              pgScore: session.pgScore,
+              finalScore: session.finalScore,
+              kkm: bank?.kkm ?? 75,
+              hasEssay: (bank?.questions.filter((q) => q.type === 'ESAI').length ?? 0) > 0,
+            }
+          : null,
+      });
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
 // ---------- ADMIN / PROKTOR / GURU ROUTES ----------
@@ -3146,7 +3838,8 @@ app.post('/api/admin/server/restore', requireAuth, requireAdmin, (req, res) => {
 
 // Runs on every API request: rotates exam tokens, closes expired sessions and
 // marks students offline when their heartbeat stops (replaces the old setInterval).
-function runMaintenance(): void {
+// On PostgreSQL, session updates must NEVER run via full-doc overwrites to prevent race conditions.
+function runMaintenance(options?: { skipSessionWrites?: boolean }): void {
   const db = store.getDb();
   const now = Date.now();
   let changed = false;
@@ -3167,36 +3860,75 @@ function runMaintenance(): void {
     }
   }
 
-  for (const s of db.sessions) {
-    if (s.status === 'SEDANG_UJIAN' && new Date(s.endsAt).getTime() <= now) {
-      const exam = db.exams.find((e) => e.id === s.examId);
-      const bank = exam ? db.banks.find((b) => b.id === exam.bankId) : undefined;
-      s.status = 'SELESAI';
-      s.finishedAt = new Date(now).toISOString();
-      s.isOnline = false;
-      calculateSessionScore(s, bank);
-      changed = true;
-      sendToStudent(s.studentId, 'admin:command', { action: 'FORCE_FINISH', sessionId: s.id });
-      sendToAdmins('session:updated', s);
-      sendToAdmins('sync:results', { sessionId: s.id, examId: s.examId });
+  if (!options?.skipSessionWrites) {
+    for (const s of db.sessions) {
+      if (s.status === 'SEDANG_UJIAN' && new Date(s.endsAt).getTime() <= now) {
+        const exam = db.exams.find((e) => e.id === s.examId);
+        const bank = exam ? db.banks.find((b) => b.id === exam.bankId) : undefined;
+        s.status = 'SELESAI';
+        s.finishedAt = new Date(now).toISOString();
+        s.isOnline = false;
+        calculateSessionScore(s, bank);
+        changed = true;
+        sendToStudent(s.studentId, 'admin:command', { action: 'FORCE_FINISH', sessionId: s.id });
+        sendToAdmins('session:updated', s);
+        sendToAdmins('sync:results', { sessionId: s.id, examId: s.examId });
+      }
     }
-  }
 
-  for (const s of db.sessions) {
-    if (
-      s.isOnline &&
-      (s.status === 'SEDANG_UJIAN' || s.status === 'TERBLOKIR') &&
-      (!s.lastHeartbeatAt || now - new Date(s.lastHeartbeatAt).getTime() > ONLINE_TIMEOUT_MS)
-    ) {
-      s.isOnline = false;
-      changed = true;
-      sendToAdmins('session:updated', s);
+    for (const s of db.sessions) {
+      if (
+        s.isOnline &&
+        (s.status === 'SEDANG_UJIAN' || s.status === 'TERBLOKIR') &&
+        (!s.lastHeartbeatAt || now - new Date(s.lastHeartbeatAt).getTime() > ONLINE_TIMEOUT_MS)
+      ) {
+        s.isOnline = false;
+        changed = true;
+        sendToAdmins('session:updated', s);
+      }
     }
   }
 
   if (changed) {
     store.commit();
   }
+}
+
+async function runPgSafeStaffMaintenance(ctx: StoreContext): Promise<void> {
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+  const cutoffIso = new Date(nowMs - ONLINE_TIMEOUT_MS).toISOString();
+
+  const staleRes = await dbPgMarkStaleSessionsOffline(cutoffIso);
+  if (staleRes) {
+    for (const s of staleRes.updatedSessions) {
+      store.syncCachedSession(s as unknown as ExamSession, staleRes.version);
+    }
+  }
+
+  const expiredSessions = ctx.db.sessions.filter(
+    (s) => s.status === 'SEDANG_UJIAN' && new Date(s.endsAt).getTime() <= nowMs
+  );
+  for (const s of expiredSessions) {
+    const finRes = await dbPgFinishStudentSession({
+      sessionId: s.id,
+      studentId: s.studentId,
+      clientAnswersPatch: null,
+      nowIso,
+      scoreSession: scoreSessionRecord,
+    });
+    if (finRes && finRes.kind === 'finished') {
+      store.syncCachedSession(finRes.session as unknown as ExamSession, finRes.version);
+      ctx.events.push({
+        audience: `student:${s.studentId}`,
+        event: 'admin:command',
+        payload: { action: 'FORCE_FINISH', sessionId: s.id },
+      });
+    }
+  }
+
+  store.run(ctx, () => runMaintenance({ skipSessionWrites: true }));
+  await store.flush(ctx);
 }
 
 // ---------- REALTIME (polling replacement for WebSocket) ----------
@@ -3213,8 +3945,12 @@ app.get('/api/events', requireAuth, async (req: AuthenticatedRequest, res) => {
     if (user.role !== 'student' && Date.now() - lastStaffTickAt > 30_000) {
       lastStaffTickAt = Date.now();
       const ctx = await store.load();
-      store.run(ctx, () => runMaintenance());
-      await store.flush(ctx);
+      if (getIsUsingPostgres()) {
+        await runPgSafeStaffMaintenance(ctx);
+      } else {
+        store.run(ctx, () => runMaintenance());
+        await store.flush(ctx);
+      }
     }
 
     const { cursor, events } = await dbPollEventsAfter(afterRaw, audiences);
@@ -3224,46 +3960,91 @@ app.get('/api/events', requireAuth, async (req: AuthenticatedRequest, res) => {
     });
   } catch (err) {
     const info = reportDbUnavailable('api/events', err);
-    res.status(503).json({ error: info.retryable ? 'Koneksi realtime terputus.' : info.userMessage, code: info.code, retryable: info.retryable });
+    res.status(503).json({
+      error: info.retryable ? 'Koneksi realtime terputus.' : info.userMessage,
+      code: info.code,
+      retryable: info.retryable,
+    });
   }
 });
 
 const lastHeartbeatEmitAt = new Map<string, number>();
 
-app.post('/api/events', requireAuth, (req: AuthenticatedRequest, res) => {
-  const user = req.user!;
-  const event = typeof req.body?.event === 'string' ? req.body.event : '';
-  const payload = (req.body?.payload || {}) as Record<string, unknown>;
+app.post('/api/events', requireAuth, async (req: AuthenticatedRequest, res, next) => {
+  try {
+    const user = req.user!;
+    const event = typeof req.body?.event === 'string' ? req.body.event : '';
+    const payload = (req.body?.payload || {}) as Record<string, unknown>;
 
-  if (event === 'student:heartbeat' && user.role === 'student') {
-    const sessionId = typeof payload.sessionId === 'string' ? payload.sessionId : '';
-    const currentIdx = typeof payload.currentQuestionIndex === 'number' ? payload.currentQuestionIndex : undefined;
-    const db = store.getDb();
-    const sess = db.sessions.find((s) => s.id === sessionId && s.studentId === user.sub);
-    if (sess) {
-      const now = Date.now();
-      const wasOffline = !sess.isOnline;
-      const questionChanged =
-        typeof currentIdx === 'number' && currentIdx >= 0 && currentIdx !== sess.currentQuestionIndex;
-      const prevHeartbeatMs = sess.lastHeartbeatAt ? new Date(sess.lastHeartbeatAt).getTime() : 0;
-      const prevEmitMs = lastHeartbeatEmitAt.get(sess.id) || 0;
+    if (event === 'student:heartbeat' && user.role === 'student') {
+      const sessionId = typeof payload.sessionId === 'string' ? payload.sessionId : '';
+      const currentIdx =
+        typeof payload.currentQuestionIndex === 'number' ? payload.currentQuestionIndex : undefined;
 
-      sess.isOnline = true;
-      sess.lastHeartbeatAt = new Date(now).toISOString();
-      if (typeof currentIdx === 'number' && currentIdx >= 0) {
-        sess.currentQuestionIndex = currentIdx;
+      if (sessionId && getIsUsingPostgres()) {
+        const now = Date.now();
+        const prevEmitMs = lastHeartbeatEmitAt.get(sessionId) || 0;
+        const emitAdmin = now - prevEmitMs >= 30_000;
+        if (emitAdmin) {
+          lastHeartbeatEmitAt.set(sessionId, now);
+          if (lastHeartbeatEmitAt.size > 2000) {
+            for (const [k, ts] of lastHeartbeatEmitAt.entries()) {
+              if (now - ts > 120_000) {
+                lastHeartbeatEmitAt.delete(k);
+              }
+            }
+          }
+        }
+        const pgHb = await dbPgStudentHeartbeat({
+          sessionId,
+          studentId: user.sub,
+          currentQuestionIndex: currentIdx,
+          nowIso: new Date(now).toISOString(),
+          emitAdminEvent: emitAdmin,
+        });
+        if (pgHb) {
+          store.syncCachedSession(pgHb.session as unknown as ExamSession, pgHb.version);
+          res.json({ ok: true });
+          return;
+        }
       }
 
-      if (wasOffline || questionChanged || now - prevHeartbeatMs >= 45_000) {
-        store.commit();
-      }
-      if (wasOffline || questionChanged || now - prevEmitMs >= 30_000) {
-        lastHeartbeatEmitAt.set(sess.id, now);
-        sendToAdmins('session:updated', sess);
+      if (sessionId) {
+        await runWithStore(res, () => {
+          const db = store.getDb();
+          const sess = db.sessions.find((s) => s.id === sessionId && s.studentId === user.sub);
+          if (sess) {
+            const now = Date.now();
+            const wasOffline = !sess.isOnline;
+            const questionChanged =
+              typeof currentIdx === 'number' && currentIdx >= 0 && currentIdx !== sess.currentQuestionIndex;
+            const prevHeartbeatMs = sess.lastHeartbeatAt ? new Date(sess.lastHeartbeatAt).getTime() : 0;
+            const prevEmitMs = lastHeartbeatEmitAt.get(sess.id) || 0;
+
+            sess.isOnline = true;
+            sess.lastHeartbeatAt = new Date(now).toISOString();
+            if (typeof currentIdx === 'number' && currentIdx >= 0) {
+              sess.currentQuestionIndex = currentIdx;
+            }
+
+            if (wasOffline || questionChanged || now - prevHeartbeatMs >= 45_000) {
+              store.commit();
+            }
+            if (wasOffline || questionChanged || now - prevEmitMs >= 30_000) {
+              lastHeartbeatEmitAt.set(sess.id, now);
+              sendToAdmins('session:updated', sess);
+            }
+          }
+          res.json({ ok: true });
+        });
+        return;
       }
     }
+
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
   }
-  res.json({ ok: true });
 });
 
 app.use('/api', (req: Request, res: Response) => {

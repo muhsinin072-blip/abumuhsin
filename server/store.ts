@@ -1280,6 +1280,90 @@ class StoreManager {
   getDbFileSizeKb(): number {
     return Math.round((this.current().sizeBytes / 1024) * 10) / 10;
   }
+
+  syncCachedSession(session: ExamSession, nextVersion?: number | null): void {
+    const cached = this.cache;
+    if (!cached) return;
+    if (this.pendingFlushes > 0) {
+      this.cache = null;
+      return;
+    }
+    const normalized: ExamSession = {
+      ...session,
+      questionOrder: Array.isArray(session.questionOrder) ? session.questionOrder : [],
+      optionOrders:
+        session.optionOrders && typeof session.optionOrders === 'object' ? session.optionOrders : {},
+      answers: session.answers && typeof session.answers === 'object' ? session.answers : {},
+    };
+    const idx = cached.db.sessions.findIndex((s) => s.id === normalized.id);
+    if (idx >= 0) {
+      cached.db.sessions[idx] = normalized;
+    } else {
+      cached.db.sessions.push(normalized);
+    }
+    const key = docKey('sessions', normalized.id);
+    const prevEntry = cached.snapshot.get(key);
+    let pos = prevEntry?.pos;
+    if (pos === undefined) {
+      let maxPos = -1;
+      for (const s of cached.db.sessions) {
+        const p = cached.snapshot.get(docKey('sessions', s.id))?.pos;
+        if (p !== undefined && p > maxPos) maxPos = p;
+      }
+      pos = maxPos + 1;
+    }
+    const json = JSON.stringify(normalized);
+    if (prevEntry) {
+      cached.sizeBytes += json.length - prevEntry.json.length;
+    } else {
+      cached.sizeBytes += json.length;
+    }
+    cached.snapshot.set(key, { json, pos });
+    cached.loadedAt = Date.now();
+    if (typeof nextVersion === 'number' && Number.isFinite(nextVersion)) {
+      cached.version = nextVersion;
+    }
+  }
+
+  syncCachedViolation(violation: ViolationLog, nextVersion?: number | null): void {
+    const cached = this.cache;
+    if (!cached) return;
+    if (this.pendingFlushes > 0) {
+      this.cache = null;
+      return;
+    }
+    const existingIdx = cached.db.violations.findIndex((v) => v.id === violation.id);
+    if (existingIdx >= 0) {
+      cached.db.violations[existingIdx] = violation;
+    } else {
+      cached.db.violations.unshift(violation);
+      if (cached.db.violations.length > 500) {
+        cached.db.violations = cached.db.violations.slice(0, 500);
+      }
+    }
+    const key = docKey('violations', violation.id);
+    const prevEntry = cached.snapshot.get(key);
+    let pos = prevEntry?.pos;
+    if (pos === undefined) {
+      let minPos = 0;
+      for (const v of cached.db.violations) {
+        const p = cached.snapshot.get(docKey('violations', v.id))?.pos;
+        if (p !== undefined && p < minPos) minPos = p;
+      }
+      pos = minPos - 1;
+    }
+    const json = JSON.stringify(violation);
+    if (prevEntry) {
+      cached.sizeBytes += json.length - prevEntry.json.length;
+    } else {
+      cached.sizeBytes += json.length;
+    }
+    cached.snapshot.set(key, { json, pos });
+    cached.loadedAt = Date.now();
+    if (typeof nextVersion === 'number' && Number.isFinite(nextVersion)) {
+      cached.version = nextVersion;
+    }
+  }
 }
 
 export const store = new StoreManager();

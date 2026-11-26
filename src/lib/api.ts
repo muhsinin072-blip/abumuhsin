@@ -164,8 +164,9 @@ export async function apiFetch<T>(url: string, options: RequestInit = {}): Promi
   const isReadMethod = method === 'GET' || method === 'HEAD';
   const idempotentWrite = method === 'POST' && isIdempotentPost(url);
   const canRetryNetwork = isReadMethod || idempotentWrite;
+  const isAnswerWrite = /^\/api\/student\/sessions\/[^/]+\/answer$/.test(url);
   const maxAttempts = isReadMethod ? 3 : idempotentWrite ? 3 : 2;
-  const timeoutMs = isReadMethod ? 15_000 : 25_000;
+  const timeoutMs = isReadMethod ? 15_000 : isAnswerWrite ? 10_000 : 25_000;
   let lastError: Error | null = null;
   let verifiedSessionAfter401 = false;
 
@@ -320,7 +321,7 @@ interface RealtimeListener {
   onStatusChange?: (connected: boolean) => void;
 }
 
-const POLL_INTERVAL_MS = 8000;
+const POLL_INTERVAL_MS = 12000;
 const POLL_ERROR_BACKOFF_MS = 10000;
 const realtimeListeners = new Set<RealtimeListener>();
 let realtimeCursor: number | null = null;
